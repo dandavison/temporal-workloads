@@ -1,0 +1,344 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Verify what `temporal activity reset` does to an Activity's attempt counter and its persisted
+heartbeat details:
+
+  reset                       resets the attempt counter, leaves the heartbeat details alone.
+  reset --reset-heartbeats    resets both.
+
+The client is the CLI: every start, describe, reset and terminate is a `temporal` invocation,
+using whatever `temporal` is on PATH. Only the worker is in-process, because there is no way to
+make an Activity heartbeat from the command line.
+
+The Activity being reset is a Workflow Activity. Standalone Activities are not covered: reading
+their heartbeat details needs DescribeActivityExecution's include_heartbeat_details, and
+`temporal activity describe` has no flag for it, so there is nothing to compare.
+
+How each case runs. The Activity heartbeats a checkpoint and dies once, so the reset lands on an
+Activity that is demonstrably past attempt 1 with a checkpoint the server holds:
+
+  1. start #1 heartbeats up to CHECKPOINT and fails, putting the Activity on attempt 2.
+  2. start #2 resumes from CHECKPOINT and holds there, heartbeating, so the Activity sits
+     visibly STARTED on attempt 2 with heartbeat details the CLI can read.
+  3. the CLI resets it, with or without --reset-heartbeats.
+  4. start #3 -- the attempt the reset produced -- records what it was handed and then waits,
+     heartbeating nothing, so the CLI can read the post-reset state before anything overwrites
+     it. The attempt counter must be back to 1 in both cases; the heartbeat details must be
+     unchanged without the flag and gone with it.
+
+Note this CLI also has a separate --reset-attempts flag, which sits oddly with a plain reset
+being expected to reset the attempt counter on its own. The expectation asserted here is the
+stated behaviour, so if a bare reset leaves the counter alone, that is the finding.
+
+Usage:
+  ./temporal-workload-activity-reset-heartbeat
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_CLI        the CLI to drive (default "temporal")
+"""
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import sys
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any
+
+from temporalio import activity, workflow
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "ResetHeartbeatWorkload"
+ACTIVITY_TYPE = "ResetHeartbeatCheckpointedJob"
+TASK_QUEUE = "reset-heartbeat-workload-tq"
+
+CHECKPOINT = 3
+CHUNK_SECONDS = 0.3
+# Long enough that the Activity can sit quiet while the CLI reads the state a reset produced.
+HEARTBEAT_TIMEOUT = timedelta(seconds=30)
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=5)
+RETRY_POLICY = RetryPolicy(
+    maximum_attempts=10, initial_interval=timedelta(seconds=1), backoff_coefficient=1.0
+)
+
+PATIENCE = 60.0
+DEFAULT = "reset"
+RESET_HEARTBEATS = "reset --reset-heartbeats"
+CASES = {DEFAULT: [], RESET_HEARTBEATS: ["--reset-heartbeats"]}
+
+ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
+CLI = os.environ.get("TEMPORAL_CLI", "temporal")
+
+
+@dataclass
+class Run:
+    """One case: one workflow, one Activity, one reset."""
+
+    case: str
+    workflow_id: str
+    starts: int = 0
+    # What each start of the Activity was handed to resume from, in order.
+    handed: list[int | None] = field(default_factory=list)
+    findings: list[str] = field(default_factory=list)
+    reset_attempt_began: asyncio.Event = field(default_factory=asyncio.Event)
+    may_heartbeat: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+RUNS: dict[str, Run] = {}
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def checkpointed_job(workflow_id: str) -> str:
+    run = RUNS[workflow_id]
+    run.starts += 1
+    start = run.starts
+    handed = (
+        activity.info().heartbeat_details[0]
+        if activity.info().heartbeat_details
+        else None
+    )
+    run.handed.append(handed)
+    log(
+        run,
+        f"start #{start} (server attempt {activity.info().attempt}): handed {handed}",
+    )
+
+    if start == 1:
+        for chunk in range(1, CHECKPOINT + 1):
+            await asyncio.sleep(CHUNK_SECONDS)
+            activity.heartbeat(chunk)
+        raise ApplicationError(f"worker died after chunk {CHECKPOINT}")
+
+    if start >= 3:
+        # The attempt the reset produced. Say nothing until the CLI has read the state, so the
+        # heartbeat details it reads are the ones the reset left behind.
+        run.reset_attempt_began.set()
+        await run.may_heartbeat.wait()
+
+    checkpoint = handed or 0
+    while True:
+        activity.heartbeat(checkpoint)
+        await asyncio.sleep(CHUNK_SECONDS)
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class ResetHeartbeatWorkload:
+    @workflow.run
+    async def run(self, workflow_id: str) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            workflow_id,
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+            heartbeat_timeout=HEARTBEAT_TIMEOUT,
+            retry_policy=RETRY_POLICY,
+        )
+
+
+def cli(*args: str) -> str:
+    """Run a CLI command against the server, failing loudly with whatever it said."""
+    command = [CLI, *args, "--address", ADDRESS, "--namespace", NAMESPACE]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        sys.exit(
+            f"{' '.join(command)} exited {completed.returncode}:\n"
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    return completed.stdout
+
+
+@dataclass(frozen=True)
+class PendingActivity:
+    """What the CLI reports about the Activity. attempt and heartbeatDetails are absent from the
+    JSON when they hold their proto3 default, which for heartbeatDetails is exactly the state a
+    --reset-heartbeats is supposed to produce."""
+
+    attempt: int
+    heartbeat_details: Any | None
+    activity_id: str
+
+    def __str__(self) -> str:
+        return (
+            f"attempt={self.attempt} heartbeatDetails={self.heartbeat_details} "
+            f"activityId={self.activity_id}"
+        )
+
+
+def describe(run: Run) -> PendingActivity | None:
+    described = json.loads(
+        cli("workflow", "describe", "--workflow-id", run.workflow_id, "-o", "json")
+    )
+    pending = described.get("pendingActivities") or []
+    if not pending:
+        return None
+    return PendingActivity(
+        attempt=pending[0].get("attempt", 1),
+        heartbeat_details=pending[0].get("heartbeatDetails"),
+        activity_id=pending[0]["activityId"],
+    )
+
+
+async def until(
+    run: Run, what: str, condition: Callable[[PendingActivity | None], bool]
+) -> bool:
+    """Poll the CLI until condition holds, rather than hanging if it never does."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + PATIENCE
+    while True:
+        if condition(await asyncio.to_thread(describe, run)):
+            return True
+        if loop.time() > deadline:
+            run.findings.append(f"timed out after {PATIENCE}s waiting for {what}")
+            return False
+        await asyncio.sleep(0.2)
+
+
+async def drive(run: Run, flags: list[str]) -> None:
+    def check(condition: bool, message: str) -> None:
+        if not condition:
+            run.findings.append(message)
+        log(run, f"{'PASS' if condition else 'FAIL'}  {message}")
+
+    if not await until(
+        run,
+        "the Activity to be running its second attempt with a checkpoint",
+        lambda p: p is not None and p.attempt == 2 and p.heartbeat_details is not None,
+    ):
+        return
+    before = await asyncio.to_thread(describe, run)
+    assert before is not None
+    log(run, f"before the reset: {before}")
+
+    await asyncio.to_thread(
+        cli,
+        "activity",
+        "reset",
+        "--workflow-id",
+        run.workflow_id,
+        "--activity-id",
+        before.activity_id,
+        *flags,
+    )
+    log(run, f"ran: temporal activity {' '.join(['reset', *flags])}")
+
+    try:
+        await asyncio.wait_for(run.reset_attempt_began.wait(), PATIENCE)
+    except TimeoutError:
+        run.findings.append(
+            f"the reset never produced a new attempt within {PATIENCE}s"
+        )
+        return
+    after = await asyncio.to_thread(describe, run)
+    assert after is not None
+    log(run, f"after the reset: {after}")
+
+    check(after.attempt == 1, f"attempt counter is {after.attempt}, want 1")
+    if flags:
+        check(
+            after.heartbeat_details is None,
+            f"heartbeat details are {after.heartbeat_details}, want them discarded",
+        )
+        check(
+            run.handed[-1] is None,
+            f"the attempt the reset produced was handed {run.handed[-1]}, want nothing",
+        )
+    else:
+        check(
+            after.heartbeat_details == before.heartbeat_details,
+            f"heartbeat details are {after.heartbeat_details}, want them left alone at "
+            f"{before.heartbeat_details}",
+        )
+        check(
+            run.handed[-1] == CHECKPOINT,
+            f"the attempt the reset produced was handed {run.handed[-1]}, want {CHECKPOINT}",
+        )
+    run.may_heartbeat.set()
+
+
+async def execute(case: str, flags: list[str]) -> Run:
+    run = Run(case=case, workflow_id=f"reset-heartbeat-{uuid.uuid4().hex[:8]}")
+    RUNS[run.workflow_id] = run
+    log(run, "")
+    await asyncio.to_thread(
+        cli,
+        "workflow",
+        "start",
+        "--workflow-id",
+        run.workflow_id,
+        "--type",
+        WORKFLOW_TYPE,
+        "--task-queue",
+        TASK_QUEUE,
+        "--input",
+        json.dumps(run.workflow_id),
+    )
+    log(run, f"started workflow {run.workflow_id}")
+    try:
+        await drive(run, flags)
+    finally:
+        run.may_heartbeat.set()
+        await asyncio.to_thread(
+            cli,
+            "workflow",
+            "terminate",
+            "--workflow-id",
+            run.workflow_id,
+            "--reason",
+            "reset-heartbeat workload",
+        )
+    return run
+
+
+def log(run: Run, message: str) -> None:
+    print(f"{run.case:>24}  {message}" if message else "", flush=True)
+
+
+async def main() -> None:
+    # The first attempt fails by design; the worker logs it at warning with a traceback.
+    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
+    try:
+        client = await Client.connect(ADDRESS, namespace=NAMESPACE)
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {ADDRESS}: {err}")
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[ResetHeartbeatWorkload],
+        activities=[checkpointed_job],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        # Keep heartbeats flowing promptly: the default throttle is 0.8 * heartbeat_timeout,
+        # which the CLI would have to wait out before it could see a checkpoint at all.
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    async with worker:
+        runs = [await execute(case, flags) for case, flags in CASES.items()]
+
+    failed = [(run.case, finding) for run in runs for finding in run.findings]
+    print(flush=True)
+    for case, finding in failed:
+        print(f"UNEXPECTED  {case}: {finding}", flush=True)
+    if failed:
+        sys.exit("reset did not treat the heartbeat details as described")
+    print(
+        "reset treated the attempt counter and heartbeat details as described",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
