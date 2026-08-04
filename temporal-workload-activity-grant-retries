@@ -1,0 +1,604 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Exercise giving a heartbeating Activity more retries when it is about to run out of them, on both
+product surfaces backed by the Activity CHASM component -- a Workflow Activity (WFA) and a
+Standalone Activity (SAA).
+
+The Activity processes CHUNKS_TOTAL chunks, heartbeating its per-chunk progress, and dies after
+CHUNKS_PER_ATTEMPT chunks, resuming from its last heartbeat. ATTEMPTS_NEEDED attempts are
+therefore required to finish the work, but the retry policy permits only INITIAL_MAX_ATTEMPTS, so
+the Activity can only succeed if an operator raises maximum_attempts while it still has an attempt
+left. Two ways of doing that are exercised per surface:
+
+  grant        UpdateActivityExecutionOptions while the last permitted attempt is running.
+  pause-grant  Pause during the last permitted attempt, wait for the Activity to come to rest
+               PAUSED, raise maximum_attempts, then Unpause.
+
+The Activity holds its last permitted attempt open -- heartbeating rather than failing -- until the
+server reports a policy that permits another attempt, so the intervention is not racing the
+failure. The operator waits until the server holds the checkpoint that says the attempt has
+finished its chunks and is about to die, so every run needs exactly ATTEMPTS_NEEDED attempts
+resuming from the same checkpoints.
+
+Both surfaces are driven through the unified operator APIs (Pause/Unpause/
+UpdateActivityExecutionOptions), which target a workflow Activity when workflow_id is set and a
+standalone one when it is empty.
+
+Usage:
+  ./temporal-workload-activity-grant-retries
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import asyncio
+import logging
+import os
+import sys
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+from google.protobuf.field_mask_pb2 import FieldMask
+from temporalio import activity, workflow
+from temporalio.api.activity.v1 import ActivityOptions
+from temporalio.api.common.v1 import Payloads
+from temporalio.api.common.v1 import RetryPolicy as RetryPolicyProto
+from temporalio.api.enums.v1 import ActivityExecutionStatus, PendingActivityState
+from temporalio.api.workflowservice.v1 import (
+    DescribeActivityExecutionRequest,
+    PauseActivityExecutionRequest,
+    UnpauseActivityExecutionRequest,
+    UpdateActivityExecutionOptionsRequest,
+)
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.service import RPCError, RPCStatusCode
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "GrantRetriesWorkload"
+ACTIVITY_TYPE = "GrantRetriesProcessChunks"
+TASK_QUEUE = "grant-retries-workload-tq"
+ACTIVITY_ID_PREFIX = "grant-retries"
+
+CHUNKS_PER_ATTEMPT = 5
+ATTEMPTS_NEEDED = 4
+CHUNKS_TOTAL = CHUNKS_PER_ATTEMPT * ATTEMPTS_NEEDED
+CHUNK_SECONDS = 0.5
+INITIAL_MAX_ATTEMPTS = 3
+RAISED_MAX_ATTEMPTS = 5
+# The checkpoint the server holds once the last attempt the initial policy permits has done its
+# chunks and is waiting to die.
+LAST_PERMITTED_CHECKPOINT = CHUNKS_PER_ATTEMPT * INITIAL_MAX_ATTEMPTS
+
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
+HEARTBEAT_TIMEOUT = timedelta(seconds=5)
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+INITIAL_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=INITIAL_MAX_ATTEMPTS,
+    initial_interval=timedelta(seconds=1),
+    backoff_coefficient=1.0,
+)
+
+POLL_INTERVAL = 0.2
+PATIENCE = 30.0
+
+GRANT = "grant"
+PAUSE_GRANT = "pause-grant"
+
+
+@dataclass(frozen=True)
+class Target:
+    """Where to find one Activity on either surface: workflow_id is empty for a Standalone
+    Activity."""
+
+    activity_id: str
+    workflow_id: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class Observation:
+    """The server's view of one Activity, normalized across the two surfaces."""
+
+    state: str
+    attempt: int
+    max_attempts: int
+    checkpoint: int | None
+    closed: bool
+
+    def __str__(self) -> str:
+        return (
+            f"state={self.state} attempt={self.attempt} "
+            f"maximum_attempts={self.max_attempts} checkpoint={self.checkpoint}"
+        )
+
+
+@dataclass
+class Attempt:
+    attempt: int
+    resumed_from: int
+    outcome: str = "in progress"
+
+
+@dataclass
+class Run:
+    """One (scenario, surface) pair."""
+
+    scenario: str
+    surface: str
+    activity_id: str
+    target: Target | None = None
+    attempts: list[Attempt] = field(default_factory=list)
+    result: str | None = None
+    failure: str | None = None
+    findings: list[str] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return f"{self.scenario}/{self.surface}"
+
+
+RUNS: dict[str, Run] = {}
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def process_chunks() -> str:
+    info = activity.info()
+    run = RUNS[info.activity_id]
+    resumed_from = info.heartbeat_details[0] if info.heartbeat_details else 0
+    record = Attempt(attempt=info.attempt, resumed_from=resumed_from)
+    run.attempts.append(record)
+    log(run, f"attempt {info.attempt}: resuming from chunk {resumed_from}")
+
+    chunk = resumed_from
+    try:
+        while chunk < CHUNKS_TOTAL:
+            await asyncio.sleep(CHUNK_SECONDS)
+            chunk += 1
+            activity.heartbeat(chunk)
+            if chunk < CHUNKS_TOTAL and chunk - resumed_from >= CHUNKS_PER_ATTEMPT:
+                await hold_until_another_attempt_is_permitted(run, chunk)
+                record.outcome = f"failed after chunk {chunk}"
+                log(run, f"attempt {info.attempt}: failing after chunk {chunk}")
+                raise ApplicationError(
+                    f"attempt {info.attempt} died after chunk {chunk}"
+                )
+    except asyncio.CancelledError:
+        details = activity.cancellation_details()
+        record.outcome = f"cancelled at chunk {chunk} ({details})"
+        log(run, f"attempt {info.attempt}: cancelled at chunk {chunk}: {details}")
+        raise
+    record.outcome = f"processed all {CHUNKS_TOTAL} chunks"
+    log(run, f"attempt {info.attempt}: all {CHUNKS_TOTAL} chunks processed")
+    return f"processed {CHUNKS_TOTAL} chunks"
+
+
+async def hold_until_another_attempt_is_permitted(run: Run, chunk: int) -> None:
+    """Keep this attempt alive, heartbeating, while the server says the retry policy permits no
+    further attempt. Returning means the operator granted one and this attempt may now fail into
+    it; in the pause scenario the wait instead ends with the pause cancellation."""
+    info = activity.info()
+    target = Target(
+        activity_id=info.activity_id,
+        workflow_id=info.workflow_id or "",
+        run_id=info.workflow_run_id or info.activity_run_id or "",
+    )
+    deadline = time.monotonic() + PATIENCE
+    while True:
+        observation = await observe(activity.client(), target)
+        if observation.max_attempts == 0 or info.attempt < observation.max_attempts:
+            log(
+                run,
+                f"attempt {info.attempt}: policy now permits {observation.max_attempts} "
+                f"attempts, so this attempt may fail",
+            )
+            return
+        if time.monotonic() > deadline:
+            raise ApplicationError(
+                f"attempt {info.attempt} is the last one permitted and no operator raised "
+                f"maximum_attempts within {PATIENCE}s",
+                non_retryable=True,
+            )
+        activity.heartbeat(chunk)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class GrantRetriesWorkload:
+    @workflow.run
+    async def run(self, activity_id: str) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            activity_id=activity_id,
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+            heartbeat_timeout=HEARTBEAT_TIMEOUT,
+            retry_policy=INITIAL_RETRY_POLICY,
+        )
+
+
+async def observe(client: Client, target: Target) -> Observation:
+    if target.workflow_id:
+        return await observe_workflow_activity(client, target)
+    return await observe_standalone_activity(client, target)
+
+
+async def observe_workflow_activity(client: Client, target: Target) -> Observation:
+    description = await client.get_workflow_handle(
+        target.workflow_id, run_id=target.run_id
+    ).describe()
+    pending = next(
+        (
+            info
+            for info in description.raw_description.pending_activities
+            if info.activity_id == target.activity_id
+        ),
+        None,
+    )
+    if pending is None:
+        # A workflow Activity has no state of its own before it is scheduled or after it is closed;
+        # all that is visible then is the workflow, whose failure is how a terminally failed
+        # Activity surfaces.
+        status = description.status.name if description.status else "UNKNOWN"
+        return Observation(
+            state=f"workflow {status}",
+            attempt=0,
+            max_attempts=0,
+            checkpoint=None,
+            closed=status != "RUNNING",
+        )
+    return Observation(
+        state=PendingActivityState.Name(pending.state).removeprefix(
+            "PENDING_ACTIVITY_STATE_"
+        ),
+        attempt=pending.attempt,
+        max_attempts=pending.maximum_attempts,
+        checkpoint=await checkpoint_of(client, pending.heartbeat_details),
+        closed=False,
+    )
+
+
+async def observe_standalone_activity(client: Client, target: Target) -> Observation:
+    response = await client.workflow_service.describe_activity_execution(
+        DescribeActivityExecutionRequest(
+            namespace=client.namespace,
+            activity_id=target.activity_id,
+            run_id=target.run_id,
+            include_heartbeat_details=True,
+        )
+    )
+    info = response.info
+    closed = info.status not in (
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_RUNNING,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_PAUSED,
+    )
+    if closed:
+        state = ActivityExecutionStatus.Name(info.status).removeprefix(
+            "ACTIVITY_EXECUTION_STATUS_"
+        )
+    else:
+        state = PendingActivityState.Name(info.run_state).removeprefix(
+            "PENDING_ACTIVITY_STATE_"
+        )
+    return Observation(
+        state=state,
+        attempt=info.attempt,
+        max_attempts=info.retry_policy.maximum_attempts,
+        checkpoint=await checkpoint_of(client, info.heartbeat_details),
+        closed=closed,
+    )
+
+
+async def checkpoint_of(client: Client, details: Payloads) -> int | None:
+    if not details.payloads:
+        return None
+    decoded = await client.data_converter.decode(details.payloads)
+    return decoded[0] if decoded else None
+
+
+async def wait_until(
+    client: Client,
+    run: Run,
+    target: Target,
+    predicate: Callable[[Observation], bool],
+    what: str,
+) -> Observation:
+    """Poll the server until predicate holds, the Activity closes, or patience runs out. The caller
+    decides what an unsatisfied predicate means, since a closed Activity is itself a finding in some
+    scenarios."""
+    deadline = time.monotonic() + PATIENCE
+    while True:
+        observation = await observe(client, target)
+        if predicate(observation) or observation.closed:
+            return observation
+        if time.monotonic() > deadline:
+            run.findings.append(
+                f"timed out after {PATIENCE}s waiting for {what}: {observation}"
+            )
+            return observation
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+def about_to_run_out(observation: Observation) -> bool:
+    return (
+        observation.attempt == INITIAL_MAX_ATTEMPTS
+        and observation.state == "STARTED"
+        and (observation.checkpoint or 0) >= LAST_PERMITTED_CHECKPOINT
+    )
+
+
+async def operate(client: Client, run: Run, target: Target) -> None:
+    """Play the operator who notices the Activity is running out of retries and gives it more."""
+    observation = await wait_until(
+        client,
+        run,
+        target,
+        about_to_run_out,
+        "the last permitted attempt to reach its checkpoint",
+    )
+    log(run, f"last permitted attempt is up: {observation}")
+    if not about_to_run_out(observation):
+        run.findings.append(
+            f"never saw the last permitted attempt running: {observation}"
+        )
+        return
+
+    if run.scenario == PAUSE_GRANT:
+        await pause(client, target)
+        log(run, f"paused: {await observe(client, target)}")
+        observation = await wait_until(
+            client,
+            run,
+            target,
+            lambda o: o.state == "PAUSED",
+            "the paused Activity to come to rest",
+        )
+        log(run, f"after the paused attempt yielded: {observation}")
+        if observation.state != "PAUSED":
+            run.findings.append(
+                f"pausing the last permitted attempt did not leave the Activity PAUSED, "
+                f"so there was nothing left to grant retries to: {observation}"
+            )
+            if observation.closed:
+                run.findings.append(
+                    f"nor is there any way back: {await recovery_attempts(client, target)}"
+                )
+            return
+
+    await raise_max_attempts(client, target)
+    observation = await observe(client, target)
+    log(run, f"after raising maximum_attempts: {observation}")
+    if observation.max_attempts != RAISED_MAX_ATTEMPTS:
+        run.findings.append(
+            f"server reports maximum_attempts={observation.max_attempts} after it was raised to "
+            f"{RAISED_MAX_ATTEMPTS}"
+        )
+
+    if run.scenario == PAUSE_GRANT:
+        await unpause(client, target)
+        log(run, f"unpaused: {await observe(client, target)}")
+
+
+async def recovery_attempts(client: Client, target: Target) -> str:
+    """What the operator can still do for an Activity that its own pause closed."""
+    outcomes: list[str] = []
+    for what, command in (
+        ("raising maximum_attempts", raise_max_attempts),
+        ("unpausing", unpause),
+    ):
+        try:
+            await command(client, target)
+            outcomes.append(f"{what}: accepted")
+        except RPCError as err:
+            outcomes.append(f"{what}: {err.message}")
+    return ", ".join(outcomes)
+
+
+async def raise_max_attempts(client: Client, target: Target) -> None:
+    await operator_command(
+        client.workflow_service.update_activity_execution_options(
+            UpdateActivityExecutionOptionsRequest(
+                namespace=client.namespace,
+                workflow_id=target.workflow_id,
+                activity_id=target.activity_id,
+                run_id=target.run_id,
+                identity=client.identity,
+                activity_options=ActivityOptions(
+                    retry_policy=RetryPolicyProto(maximum_attempts=RAISED_MAX_ATTEMPTS)
+                ),
+                update_mask=FieldMask(paths=["retry_policy.maximum_attempts"]),
+            )
+        )
+    )
+
+
+async def pause(client: Client, target: Target) -> None:
+    await operator_command(
+        client.workflow_service.pause_activity_execution(
+            PauseActivityExecutionRequest(
+                namespace=client.namespace,
+                workflow_id=target.workflow_id,
+                activity_id=target.activity_id,
+                run_id=target.run_id,
+                identity=client.identity,
+                reason="grant-retries workload",
+                request_id=str(uuid.uuid4()),
+            )
+        )
+    )
+
+
+async def unpause(client: Client, target: Target) -> None:
+    await operator_command(
+        client.workflow_service.unpause_activity_execution(
+            UnpauseActivityExecutionRequest(
+                namespace=client.namespace,
+                workflow_id=target.workflow_id,
+                activity_id=target.activity_id,
+                run_id=target.run_id,
+                identity=client.identity,
+                reason="grant-retries workload",
+            )
+        )
+    )
+
+
+async def operator_command(command: Awaitable[object]) -> None:
+    """Await an operator command, saying what to turn on if the server does not have Standalone
+    Activity operator commands enabled."""
+    try:
+        await command
+    except RPCError as err:
+        if err.status != RPCStatusCode.UNIMPLEMENTED:
+            raise
+        sys.exit(
+            f"{err.message}: start the server with --dynamic-config-value "
+            "'history.enableStandaloneActivityOperatorCommands=true'"
+        )
+
+
+async def start_workflow_activity(
+    client: Client, run: Run
+) -> tuple[Target, Awaitable[str]]:
+    handle = await client.start_workflow(
+        GrantRetriesWorkload.run,
+        run.activity_id,
+        id=f"{run.activity_id}-workflow",
+        task_queue=TASK_QUEUE,
+    )
+    log(run, f"started workflow {handle.id}")
+    target = Target(
+        activity_id=run.activity_id, workflow_id=handle.id, run_id=handle.run_id or ""
+    )
+    return target, handle.result()
+
+
+async def start_standalone_activity(
+    client: Client, run: Run
+) -> tuple[Target, Awaitable[str]]:
+    handle = await client.start_activity(
+        process_chunks,
+        id=run.activity_id,
+        task_queue=TASK_QUEUE,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=INITIAL_RETRY_POLICY,
+    )
+    log(run, f"started activity {run.activity_id}")
+    target = Target(
+        activity_id=run.activity_id, workflow_id="", run_id=handle.run_id or ""
+    )
+    return target, handle.result()
+
+
+async def collect_outcome(run: Run, result: Awaitable[str]) -> None:
+    try:
+        run.result = await result
+        log(run, f"result: {run.result}")
+    except Exception as err:  # noqa: BLE001 -- any failure of the execution is a finding
+        run.failure = f"{type(err).__name__}: {err}"
+        log(run, f"failed: {run.failure}")
+
+
+async def execute(client: Client, scenario: str, surface: str) -> Run:
+    run = Run(
+        scenario=scenario,
+        surface=surface,
+        activity_id=f"{ACTIVITY_ID_PREFIX}-{scenario}-{surface.lower()}-{uuid.uuid4().hex[:8]}",
+    )
+    RUNS[run.activity_id] = run
+    log(run, "")
+    start = start_workflow_activity if surface == "WFA" else start_standalone_activity
+    target, result = await start(client, run)
+    run.target = target
+    await asyncio.gather(collect_outcome(run, result), operate(client, run, target))
+    return run
+
+
+def problems(run: Run) -> list[str]:
+    """What did not behave as an operator granting retries should expect."""
+    found = list(run.findings)
+    if run.failure is not None:
+        found.append(f"did not succeed once granted more retries: {run.failure}")
+    expected = [
+        (attempt, (attempt - 1) * CHUNKS_PER_ATTEMPT)
+        for attempt in range(1, ATTEMPTS_NEEDED + 1)
+    ]
+    observed = [(record.attempt, record.resumed_from) for record in run.attempts]
+    if observed != expected:
+        found.append(
+            f"expected attempts (attempt, resumed from) {expected}, worker saw {observed}"
+        )
+    return found
+
+
+def report(run: Run) -> bool:
+    log(run, "")
+    log(run, f"{'attempt':>8}  {'resumed from':>12}  outcome")
+    for record in run.attempts:
+        log(run, f"{record.attempt:>8}  {record.resumed_from:>12}  {record.outcome}")
+    found = problems(run)
+    for problem in found:
+        log(run, f"UNEXPECTED: {problem}")
+    if not found:
+        log(
+            run,
+            f"raising maximum_attempts to {RAISED_MAX_ATTEMPTS} gave the Activity the "
+            f"{ATTEMPTS_NEEDED}th attempt it needed, resuming from chunk "
+            f"{LAST_PERMITTED_CHECKPOINT}",
+        )
+    return not found
+
+
+def log(run: Run, message: str) -> None:
+    print(f"{run.name:>22}  {message}" if message else "", flush=True)
+
+
+async def main() -> None:
+    # Every attempt but the last fails by design; the worker logs each one at warning with a
+    # traceback, which would bury the report.
+    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[GrantRetriesWorkload],
+        activities=[process_chunks],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        # Keep heartbeats flowing to the server promptly: the default throttle is
+        # 0.8 * heartbeat_timeout, which the operator would have to wait out before it could see
+        # that the last permitted attempt has done its chunks.
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    runs: list[Run] = []
+    async with worker:
+        for scenario in (GRANT, PAUSE_GRANT):
+            for surface in ("WFA", "SAA"):
+                runs.append(await execute(client, scenario, surface))
+
+    if not all(report(run) for run in runs):
+        sys.exit("granting more retries did not behave as described")
+    print("granting more retries behaved as described on both surfaces", flush=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
