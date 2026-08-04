@@ -11,9 +11,10 @@ heartbeat details:
   reset                       resets the attempt counter, leaves the heartbeat details alone.
   reset --reset-heartbeats    resets both.
 
-The client is the CLI: every start, describe, reset and terminate is a `temporal` invocation,
-using whatever `temporal` is on PATH. Only the worker is in-process, because there is no way to
-make an Activity heartbeat from the command line.
+The client is the CLI: every start, describe, reset and terminate is an invocation of the binary
+TEMPORAL_CLI names, which must be set -- which CLI is under test is the point, so there is no
+default. Only the worker is in-process, because there is no way to make an Activity heartbeat
+from the command line.
 
 The Activity being reset is a Workflow Activity. Standalone Activities are not covered: reading
 their heartbeat details needs DescribeActivityExecution's include_heartbeat_details, and
@@ -39,9 +40,9 @@ Usage:
   ./temporal-workload-activity-reset-heartbeat
 
 Env vars:
+  TEMPORAL_CLI        the CLI binary to drive. Required.
   TEMPORAL_ADDRESS    (default localhost:7233)
   TEMPORAL_NAMESPACE  (default "default")
-  TEMPORAL_CLI        the CLI to drive (default "temporal")
 """
 
 import asyncio
@@ -83,7 +84,9 @@ CASES = {DEFAULT: [], RESET_HEARTBEATS: ["--reset-heartbeats"]}
 
 ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
-CLI = os.environ.get("TEMPORAL_CLI", "temporal")
+CLI = os.environ.get("TEMPORAL_CLI", "")
+if not CLI:
+    sys.exit("set TEMPORAL_CLI to the temporal CLI binary to drive")
 
 
 @dataclass
