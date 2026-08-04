@@ -1,0 +1,341 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Exercise the heartbeat-timeout path of Activity heartbeating on both product surfaces that use
+the Activity CHASM component -- a Workflow Activity (WFA) and a Standalone Activity (SAA) --
+and check that the checkpoint an attempt heartbeated survives the timeout in all three places
+it is meant to appear:
+
+  1. the next attempt's heartbeat details, so work resumes where the dead attempt stopped;
+  2. Describe's view while the retry backs off: a heartbeat TimeoutFailure as the last failure,
+     alongside the surviving checkpoint as heartbeat details;
+  3. the terminal TimeoutFailure.last_heartbeat_details the caller sees once retries are
+     exhausted, so a caller that gives up can still recover the progress. Note this lives on
+     the outermost TimeoutFailure; its cause is the previous attempt's, which carries none.
+
+Every attempt heartbeats CHUNKS_PER_ATTEMPT chunks, confirms the server has the last one, then
+stops heartbeating until the server times the attempt out. All attempts stall, so the Activity
+is expected to fail: the workload asserts on the terminal error rather than a result.
+
+The stalled attempt keeps running in the worker -- nothing tells a worker its Activity was
+timed out until it next heartbeats -- so after the timeout has certainly fired each attempt
+resumes heartbeating purely to be told the task is gone, which is what makes the worker cancel
+it and lets the worker shut down cleanly.
+
+Usage:
+  ./temporal-workload-activity-heartbeat-timeout
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import asyncio
+import itertools
+import os
+import sys
+import uuid
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payloads
+from temporalio.api.failure.v1 import Failure
+from temporalio.api.workflowservice.v1 import DescribeActivityExecutionRequest
+from temporalio.client import ActivityFailureError, Client, WorkflowFailureError
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import TimeoutError, TimeoutType
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "HeartbeatTimeoutWorkload"
+ACTIVITY_TYPE = "StallAfterHeartbeats"
+TASK_QUEUE = "heartbeat-timeout-workload-tq"
+
+CHUNKS_PER_ATTEMPT = 3
+CHUNK_SECONDS = 0.3
+MAX_ATTEMPTS = 3
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
+HEARTBEAT_TIMEOUT = timedelta(seconds=3)
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+RETRY_POLICY = RetryPolicy(
+    maximum_attempts=MAX_ATTEMPTS,
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=1.0,
+)
+
+
+@dataclass
+class Attempt:
+    attempt: int
+    resumed_from: int
+    stalled_at: int | None = None
+    previous_failure: Exception | None = None
+
+
+@dataclass
+class Surface:
+    """One of the two product surfaces backed by the Activity CHASM component."""
+
+    name: str
+    attempts: list[Attempt] = field(default_factory=list)
+    terminal_failure: Exception | None = None
+
+
+WFA = Surface("WFA")
+SAA = Surface("SAA")
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def stall_after_heartbeats() -> str:
+    info = activity.info()
+    surface = WFA if info.in_workflow else SAA
+    resumed_from = info.heartbeat_details[0] if info.heartbeat_details else 0
+    record = Attempt(attempt=info.attempt, resumed_from=resumed_from)
+    surface.attempts.append(record)
+    log(f"{surface.name} attempt {info.attempt}: resuming from chunk {resumed_from}")
+
+    if info.attempt > 1:
+        record.previous_failure = await server_last_failure()
+        log(
+            f"{surface.name} attempt {info.attempt}: server reports previous failure "
+            f"{describe_failure(record.previous_failure)}"
+        )
+
+    chunk = resumed_from
+    for _ in range(CHUNKS_PER_ATTEMPT):
+        await asyncio.sleep(CHUNK_SECONDS)
+        chunk += 1
+        activity.heartbeat(chunk)
+    await await_server_progress(chunk)
+    record.stalled_at = chunk
+    log(
+        f"{surface.name} attempt {info.attempt}: server confirmed chunk {chunk}; "
+        f"stalling until the heartbeat timeout fires"
+    )
+
+    # Nothing tells a worker its Activity was timed out until it heartbeats again, so wait out
+    # the timeout and then heartbeat to be told the task is gone, which cancels this attempt.
+    await asyncio.sleep(2 * HEARTBEAT_TIMEOUT.total_seconds())
+    while True:
+        activity.heartbeat(chunk)
+        await asyncio.sleep(0.2)
+
+
+async def await_server_progress(chunk: int) -> None:
+    """Block until the server has recorded chunk as this Activity's heartbeat progress. Do not
+    heartbeat while waiting: a heartbeat recorded after the one we are waiting for would reset
+    the heartbeat timeout we are about to provoke."""
+    while await server_progress() != chunk:
+        await asyncio.sleep(0.1)
+
+
+async def server_progress() -> int | None:
+    client = activity.client()
+    payloads = (await server_activity_state()).heartbeat_details.payloads
+    decoded = await client.data_converter.decode(payloads) if payloads else []
+    return decoded[0] if decoded else None
+
+
+async def server_last_failure() -> Exception | None:
+    """The failure of this Activity's previous attempt, as the server reports it."""
+    failure = (await server_activity_state()).last_failure
+    if not failure.ByteSize():
+        return None
+    return await activity.client().data_converter.decode_failure(failure)
+
+
+@dataclass
+class ActivityState:
+    """The subset of server-side Activity state this workload inspects, from whichever Describe
+    API serves the surface the Activity is running on."""
+
+    heartbeat_details: Payloads
+    last_failure: Failure
+
+
+async def server_activity_state() -> ActivityState:
+    info = activity.info()
+    client = activity.client()
+    if info.in_workflow:
+        description = await client.get_workflow_handle(
+            info.workflow_id or "", run_id=info.workflow_run_id
+        ).describe()
+        pending = next(
+            pending
+            for pending in description.raw_description.pending_activities
+            if pending.activity_id == info.activity_id
+        )
+        return ActivityState(pending.heartbeat_details, pending.last_failure)
+    response = await client.workflow_service.describe_activity_execution(
+        DescribeActivityExecutionRequest(
+            namespace=info.namespace,
+            activity_id=info.activity_id,
+            run_id=info.activity_run_id or "",
+            include_heartbeat_details=True,
+            include_last_failure=True,
+        )
+    )
+    return ActivityState(response.info.heartbeat_details, response.info.last_failure)
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class HeartbeatTimeoutWorkload:
+    @workflow.run
+    async def run(self) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+            heartbeat_timeout=HEARTBEAT_TIMEOUT,
+            retry_policy=RETRY_POLICY,
+        )
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def describe_failure(err: Exception | None) -> str:
+    if not isinstance(err, TimeoutError):
+        return repr(err)
+    return (
+        f"TimeoutError(type={err.type.name if err.type else None}, "
+        f"last_heartbeat_details={list(err.last_heartbeat_details)})"
+    )
+
+
+def heartbeat_timeout_checkpoint(err: Exception | None) -> int | None:
+    """The checkpoint carried by a heartbeat TimeoutError, or None if this is not one."""
+    if not isinstance(err, TimeoutError) or err.type != TimeoutType.HEARTBEAT:
+        return None
+    details = list(err.last_heartbeat_details)
+    return details[0] if details else None
+
+
+def report(surface: Surface) -> bool:
+    log("")
+    log(f"{surface.name}  {'attempt':>8}  {'resumed from':>12}  {'stalled at':>10}")
+    for record in surface.attempts:
+        log(
+            f"{' ' * len(surface.name)}  {record.attempt:>8}  {record.resumed_from:>12}  "
+            f"{record.stalled_at!s:>10}"
+        )
+    log("")
+
+    ok = True
+
+    def check(condition: bool, message: str) -> None:
+        nonlocal ok
+        if not condition:
+            ok = False
+        log(f"{'PASS' if condition else 'FAIL'}  {surface.name} {message}")
+
+    check(
+        len(surface.attempts) == MAX_ATTEMPTS,
+        f"ran {len(surface.attempts)} attempts, want {MAX_ATTEMPTS}",
+    )
+    for previous, current in itertools.pairwise(surface.attempts):
+        check(
+            current.resumed_from == previous.stalled_at,
+            f"attempt {current.attempt} resumed from {current.resumed_from}, "
+            f"want {previous.stalled_at} heartbeated by attempt {previous.attempt}",
+        )
+        # Only the type is asserted here: neither surface attaches lastHeartbeatDetails to the
+        # per-attempt failure Describe reports, because the checkpoint is already on the same
+        # response as heartbeat_details (checked above via what the next attempt resumed from).
+        # It appears on the terminal failure, the caller's last chance to read it.
+        check(
+            isinstance(current.previous_failure, TimeoutError)
+            and current.previous_failure.type == TimeoutType.HEARTBEAT,
+            f"attempt {previous.attempt}'s recorded failure is "
+            f"{describe_failure(current.previous_failure)}, want a heartbeat TimeoutError",
+        )
+
+    last = surface.attempts[-1] if surface.attempts else None
+    check(
+        last is not None
+        and heartbeat_timeout_checkpoint(surface.terminal_failure) == last.stalled_at,
+        f"terminal failure is {describe_failure(surface.terminal_failure)}, want a heartbeat "
+        f"TimeoutError carrying {last.stalled_at if last else None}",
+    )
+    return ok
+
+
+def outermost_timeout_error(err: BaseException) -> TimeoutError | None:
+    """The first TimeoutError walking the cause chain inwards. Not the root cause: a timed-out
+    Activity's terminal failure is a TimeoutFailure carrying the checkpoint whose cause is the
+    previous attempt's TimeoutFailure, which carries none."""
+    while err is not None:
+        if isinstance(err, TimeoutError):
+            return err
+        err = err.__cause__  # type: ignore[assignment]
+    return None
+
+
+async def run_workflow_activity(client: Client) -> None:
+    handle = await client.start_workflow(
+        HeartbeatTimeoutWorkload.run,
+        id=f"heartbeat-timeout-workload-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+    )
+    log(f"started workflow {handle.id}")
+    try:
+        log(f"workflow result: {await handle.result()}")
+    except WorkflowFailureError as err:
+        WFA.terminal_failure = outermost_timeout_error(err)
+        log(f"workflow failed with root cause {describe_failure(WFA.terminal_failure)}")
+
+
+async def run_standalone_activity(client: Client) -> None:
+    handle = await client.start_activity(
+        stall_after_heartbeats,
+        id=f"heartbeat-timeout-workload-activity-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=RETRY_POLICY,
+    )
+    log(f"started activity {handle.id}")
+    try:
+        log(f"activity result: {await handle.result()}")
+    except ActivityFailureError as err:
+        SAA.terminal_failure = outermost_timeout_error(err)
+        log(f"activity failed with root cause {describe_failure(SAA.terminal_failure)}")
+
+
+async def main() -> None:
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[HeartbeatTimeoutWorkload],
+        activities=[stall_after_heartbeats],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        # Keep heartbeats flowing to the server promptly: the default throttle is
+        # 0.8 * heartbeat_timeout, which each attempt would have to wait out before stalling.
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    async with worker:
+        await run_workflow_activity(client)
+        await run_standalone_activity(client)
+
+    if not all([report(WFA), report(SAA)]):
+        sys.exit("heartbeat timeout did not behave as described")
+    log("heartbeat timeout behaved as described on both surfaces")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
