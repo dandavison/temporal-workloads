@@ -1,0 +1,399 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Check what the operator commands do to an Activity's heartbeat checkpoint, on both product
+surfaces that use the Activity CHASM component -- a Workflow Activity (WFA) and a Standalone
+Activity (SAA). Intended semantics, from chasm/lib/activity/activity.go:
+
+  - pause and unpause leave the checkpoint alone, so a paused-and-resumed Activity picks up
+    where it left off. UnpauseActivityExecutionRequest reserved the reset_heartbeat field its
+    deprecated predecessor had, so unpause has no way to ask for otherwise.
+  - reset clears it (clearHeartbeatDetails in both reset and resetKeepPaused) and puts the
+    Activity back on attempt 1, so it starts over from nothing.
+
+A long-running Activity heartbeats an incrementing checkpoint. The driver waits for the server
+to hold one, then pauses, unpauses and resets, reading the server's view between operations and
+recording what each fresh attempt was handed to resume from. Both surfaces are driven through
+the same unified APIs (Pause/Unpause/ResetActivityExecution), which target a workflow Activity
+when workflow_id is set and a standalone one when it is empty.
+
+Usage:
+  ./temporal-workload-activity-heartbeat-pause-reset
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import asyncio
+import os
+import sys
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payloads
+from temporalio.api.enums.v1 import PendingActivityState
+from temporalio.api.workflowservice.v1 import (
+    DescribeActivityExecutionRequest,
+    PauseActivityExecutionRequest,
+    ResetActivityExecutionRequest,
+    UnpauseActivityExecutionRequest,
+)
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.service import RPCError, RPCStatusCode
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "HeartbeatPauseResetWorkload"
+ACTIVITY_TYPE = "HeartbeatForever"
+TASK_QUEUE = "heartbeat-pause-reset-workload-tq"
+
+CHECKPOINT_TO_REACH = 3
+CHUNK_SECONDS = 0.3
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=5)
+HEARTBEAT_TIMEOUT = timedelta(seconds=10)
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+RETRY_POLICY = RetryPolicy(maximum_attempts=10, initial_interval=timedelta(seconds=1))
+
+
+@dataclass
+class Surface:
+    """One of the two product surfaces backed by the Activity CHASM component."""
+
+    name: str
+    workflow_id: str | None = None
+    activity_id: str = ""
+    run_id: str = ""
+    # What each attempt of the Activity was handed to resume from, in order.
+    resumed_from: list[int] = field(default_factory=list)
+    # What Describe reported immediately after resetting the paused Activity.
+    checkpoint_after_reset: int | None = None
+
+
+WFA = Surface("WFA")
+SAA = Surface("SAA")
+
+
+@dataclass
+class ActivityState:
+    """The subset of server-side Activity state this workload inspects, from whichever Describe
+    API serves the surface the Activity is running on."""
+
+    heartbeat_details: Payloads
+    attempt: int
+    # Both surfaces report this as a PendingActivityState. Note PAUSE_REQUESTED, not PAUSED,
+    # is what a pause first produces: the running attempt is only told it was paused when it
+    # next heartbeats, and until then it keeps working. Unpausing during that window leaves the
+    # original attempt running rather than starting a new one.
+    run_state: PendingActivityState.ValueType
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def heartbeat_forever() -> str:
+    info = activity.info()
+    surface = WFA if info.in_workflow else SAA
+    resumed_from = info.heartbeat_details[0] if info.heartbeat_details else 0
+    surface.resumed_from.append(resumed_from)
+    log(
+        f"{surface.name} attempt {info.attempt}: resuming from checkpoint {resumed_from}"
+    )
+
+    checkpoint = resumed_from
+    while True:
+        await asyncio.sleep(CHUNK_SECONDS)
+        checkpoint += 1
+        activity.heartbeat(checkpoint)
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class HeartbeatPauseResetWorkload:
+    @workflow.run
+    async def run(self) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+            heartbeat_timeout=HEARTBEAT_TIMEOUT,
+            retry_policy=RETRY_POLICY,
+        )
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+async def activity_state(client: Client, surface: Surface) -> ActivityState:
+    if surface.workflow_id is not None:
+        description = await client.get_workflow_handle(
+            surface.workflow_id, run_id=surface.run_id
+        ).describe()
+        pending = next(
+            iter(description.raw_description.pending_activities),
+            None,
+        )
+        if pending is None:
+            return ActivityState(
+                Payloads(), 0, PendingActivityState.PENDING_ACTIVITY_STATE_UNSPECIFIED
+            )
+        surface.activity_id = pending.activity_id
+        return ActivityState(pending.heartbeat_details, pending.attempt, pending.state)
+    response = await client.workflow_service.describe_activity_execution(
+        DescribeActivityExecutionRequest(
+            namespace=client.namespace,
+            activity_id=surface.activity_id,
+            run_id=surface.run_id,
+            include_heartbeat_details=True,
+        )
+    )
+    return ActivityState(
+        response.info.heartbeat_details,
+        response.info.attempt,
+        response.info.run_state,
+    )
+
+
+async def attempts_reached(surface: Surface, count: int) -> bool:
+    return len(surface.resumed_from) >= count
+
+
+async def is_paused_and_stopped(client: Client, surface: Surface) -> bool:
+    state = await activity_state(client, surface)
+    return state.run_state == PendingActivityState.PENDING_ACTIVITY_STATE_PAUSED
+
+
+async def checkpoint(client: Client, surface: Surface) -> int | None:
+    payloads = (await activity_state(client, surface)).heartbeat_details.payloads
+    decoded = await client.data_converter.decode(payloads) if payloads else []
+    return decoded[0] if decoded else None
+
+
+async def until(
+    description: str, condition: Callable[[], Awaitable[bool]], seconds: float = 60
+) -> None:
+    """Poll until condition holds, failing loudly rather than hanging if it never does."""
+    deadline = time.monotonic() + seconds
+    while not await condition():
+        if time.monotonic() > deadline:
+            sys.exit(f"timed out after {seconds}s waiting for {description}")
+        await asyncio.sleep(0.1)
+
+
+async def await_checkpoint(client: Client, surface: Surface, least: int) -> int:
+    async def reached() -> bool:
+        current = await checkpoint(client, surface)
+        return current is not None and current >= least
+
+    await until(f"{surface.name} checkpoint >= {least}", reached)
+    current = await checkpoint(client, surface)
+    assert current is not None
+    return current
+
+
+async def pause(client: Client, surface: Surface) -> None:
+    # Standalone Activity operator commands are behind history.enableStandaloneActivityOperatorCommands,
+    # which defaults to false, so say what to turn on rather than surfacing a bare Unimplemented.
+    if surface is SAA:
+        try:
+            await pause_request(client, surface)
+        except RPCError as err:
+            if err.status != RPCStatusCode.UNIMPLEMENTED:
+                raise
+            sys.exit(
+                f"{err.message}: start the server with --dynamic-config-value "
+                "'history.enableStandaloneActivityOperatorCommands=true'"
+            )
+        return
+    await pause_request(client, surface)
+
+
+async def pause_request(client: Client, surface: Surface) -> None:
+    await client.workflow_service.pause_activity_execution(
+        PauseActivityExecutionRequest(
+            namespace=client.namespace,
+            workflow_id=surface.workflow_id or "",
+            activity_id=surface.activity_id,
+            run_id=surface.run_id,
+            identity=client.identity,
+            reason="heartbeat-pause-reset workload",
+            request_id=str(uuid.uuid4()),
+        )
+    )
+
+
+async def unpause(client: Client, surface: Surface) -> None:
+    await client.workflow_service.unpause_activity_execution(
+        UnpauseActivityExecutionRequest(
+            namespace=client.namespace,
+            workflow_id=surface.workflow_id or "",
+            activity_id=surface.activity_id,
+            run_id=surface.run_id,
+            identity=client.identity,
+            reason="heartbeat-pause-reset workload",
+        )
+    )
+
+
+async def reset(client: Client, surface: Surface) -> None:
+    await client.workflow_service.reset_activity_execution(
+        ResetActivityExecutionRequest(
+            namespace=client.namespace,
+            workflow_id=surface.workflow_id or "",
+            activity_id=surface.activity_id,
+            run_id=surface.run_id,
+            identity=client.identity,
+            keep_paused=True,
+        )
+    )
+
+
+async def drive(client: Client, surface: Surface) -> list[tuple[bool, str]]:
+    """Pause, unpause and reset the running Activity, checking the checkpoint at each step."""
+    checks: list[tuple[bool, str]] = []
+
+    def check(condition: bool, message: str) -> None:
+        checks.append((condition, message))
+        log(f"{'PASS' if condition else 'FAIL'}  {surface.name} {message}")
+
+    # Every read of the checkpoint happens while the Activity is paused with no attempt running.
+    # Reading it while an attempt is live races with that attempt's next heartbeat, which is how
+    # a checkpoint can legitimately move on between a pause request and the attempt noticing it.
+    reached = await await_checkpoint(client, surface, CHECKPOINT_TO_REACH)
+    log(f"{surface.name}: server holds checkpoint {reached}; pausing")
+    paused_at = await pause_and_settle(client, surface, check)
+    check(
+        paused_at is not None and paused_at >= reached,
+        f"kept a checkpoint across pause ({paused_at}, want >= {reached})",
+    )
+
+    resumed_at = await unpause_and_await_attempt(client, surface)
+    check(
+        resumed_at == paused_at,
+        f"attempt after unpause resumed from {resumed_at}, want {paused_at}",
+    )
+
+    await await_checkpoint(client, surface, (paused_at or 0) + 1)
+    log(f"{surface.name}: pausing again, then resetting while paused")
+    paused_again_at = await pause_and_settle(client, surface, check)
+
+    await reset(client, surface)
+    # Not a pass/fail: the two surfaces clear the checkpoint at different moments, so this is
+    # recorded for comparison. SAA clears it inside the reset transaction (clearHeartbeatDetails
+    # in chasm/lib/activity/activity.go), while WFA defers it to when the next attempt is
+    # scheduled -- deliberately, because a still-running attempt may keep heartbeating
+    # (service/history/workflow/activity.go). So Describe can still report the old checkpoint
+    # here even though the next attempt will be handed nothing.
+    surface.checkpoint_after_reset = await checkpoint(client, surface)
+    log(
+        f"{surface.name}: Describe reports checkpoint {surface.checkpoint_after_reset} "
+        f"immediately after resetting a paused Activity (was {paused_again_at})"
+    )
+    check(
+        (await activity_state(client, surface)).attempt == 1,
+        "is back on attempt 1 after reset",
+    )
+
+    resumed_at = await unpause_and_await_attempt(client, surface)
+    check(resumed_at == 0, f"attempt after reset resumed from {resumed_at}, want 0")
+    return checks
+
+
+async def pause_and_settle(
+    client: Client, surface: Surface, check: Callable[[bool, str], None]
+) -> int | None:
+    """Pause and wait for the running attempt to actually stop, then read the checkpoint."""
+    await pause(client, surface)
+    await until(
+        f"{surface.name} to stop the running attempt and settle into PAUSED",
+        lambda: is_paused_and_stopped(client, surface),
+    )
+    state = await activity_state(client, surface)
+    check(
+        state.run_state == PendingActivityState.PENDING_ACTIVITY_STATE_PAUSED,
+        f"is paused with no attempt running (attempt {state.attempt})",
+    )
+    return await checkpoint(client, surface)
+
+
+async def unpause_and_await_attempt(client: Client, surface: Surface) -> int:
+    """Unpause and return what the resulting fresh attempt was handed to resume from."""
+    attempts_before = len(surface.resumed_from)
+    await unpause(client, surface)
+    await until(
+        f"{surface.name} to start a new attempt after unpause",
+        lambda: attempts_reached(surface, attempts_before + 1),
+    )
+    return surface.resumed_from[attempts_before]
+
+
+async def run_workflow_activity(client: Client) -> list[tuple[bool, str]]:
+    handle = await client.start_workflow(
+        HeartbeatPauseResetWorkload.run,
+        id=f"heartbeat-pause-reset-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+    )
+    WFA.workflow_id = handle.id
+    WFA.run_id = handle.result_run_id or ""
+    log(f"started workflow {handle.id}")
+    try:
+        return await drive(client, WFA)
+    finally:
+        await handle.terminate()
+
+
+async def run_standalone_activity(client: Client) -> list[tuple[bool, str]]:
+    handle = await client.start_activity(
+        heartbeat_forever,
+        id=f"heartbeat-pause-reset-activity-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=RETRY_POLICY,
+    )
+    SAA.activity_id = handle.id
+    SAA.run_id = handle.run_id or ""
+    log(f"started activity {handle.id}")
+    try:
+        return await drive(client, SAA)
+    finally:
+        await handle.terminate()
+
+
+async def main() -> None:
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[HeartbeatPauseResetWorkload],
+        activities=[heartbeat_forever],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    async with worker:
+        checks = await run_workflow_activity(client)
+        checks += await run_standalone_activity(client)
+
+    failed = [message for ok, message in checks if not ok]
+    if failed:
+        sys.exit(f"{len(failed)} of {len(checks)} checks failed")
+    log(f"all {len(checks)} checks passed on both surfaces")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
