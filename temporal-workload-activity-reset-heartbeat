@@ -99,6 +99,11 @@ class Run:
     # What each start of the Activity was handed to resume from, in order.
     handed: list[int | None] = field(default_factory=list)
     findings: list[str] = field(default_factory=list)
+    # Set by the driver immediately before it issues the reset, so the Activity can tell which of
+    # its starts is the one the reset produced. Counting starts cannot: whether the reset lands on
+    # a running attempt or on one still in retry backoff decides how many starts precede it.
+    reset_issued: bool = False
+    holding: asyncio.Event = field(default_factory=asyncio.Event)
     reset_attempt_began: asyncio.Event = field(default_factory=asyncio.Event)
     may_heartbeat: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -128,11 +133,15 @@ async def checkpointed_job(workflow_id: str) -> str:
             activity.heartbeat(chunk)
         raise ApplicationError(f"worker died after chunk {CHECKPOINT}")
 
-    if start >= 3:
+    if run.reset_issued:
         # The attempt the reset produced. Say nothing until the CLI has read the state, so the
         # heartbeat details it reads are the ones the reset left behind.
         run.reset_attempt_began.set()
         await run.may_heartbeat.wait()
+    else:
+        # The attempt the reset will land on. Tell the driver it is really running, rather than
+        # leaving it to infer that from a Describe that looks the same during retry backoff.
+        run.holding.set()
 
     checkpoint = handed or 0
     while True:
@@ -217,6 +226,13 @@ async def drive(run: Run, flags: list[str]) -> None:
             run.findings.append(message)
         log(run, f"{'PASS' if condition else 'FAIL'}  {message}")
 
+    try:
+        await asyncio.wait_for(run.holding.wait(), PATIENCE)
+    except TimeoutError:
+        run.findings.append(
+            f"the Activity never got past its first attempt within {PATIENCE}s"
+        )
+        return
     if not await until(
         run,
         "the Activity to be running its second attempt with a checkpoint",
@@ -227,6 +243,7 @@ async def drive(run: Run, flags: list[str]) -> None:
     assert before is not None
     log(run, f"before the reset: {before}")
 
+    run.reset_issued = True
     await asyncio.to_thread(
         cli,
         "activity",
