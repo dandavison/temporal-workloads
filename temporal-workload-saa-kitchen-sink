@@ -1,0 +1,671 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Take one Standalone Activity through a long, involved life and drive as much of the SAA API
+surface at it as a real deployment plausibly would.
+
+The narrative is a chunked job whose progress lives in an external ledger. Three parties act on
+the same Activity:
+
+  the worker    runs attempts, heartbeats per-chunk progress, and dies partway through.
+  the operator  notices the job is running out of retries, pauses it, inspects it, raises
+                maximum_attempts, and unpauses it.
+  the ledger    an external system that reports progress and finishes the job out of band,
+                addressing the Activity by ID rather than by task token.
+
+Acts, in order, per run:
+
+  1. each attempt heartbeats CHUNKS_PER_ATTEMPT chunks and dies, so the next resumes from its
+     checkpoint, until OPERATOR_ATTEMPT.
+  2. that attempt does its chunks and then holds, heartbeating, going nowhere.
+  3. the operator pauses it, and once it has come to rest PAUSED -- with no attempt in progress
+     -- the ledger tries to heartbeat, fail and cancel it by ID. All three are expected to be
+     rejected: only completion is permitted with no attempt running (allowForceCompleteWithNoAttempt
+     in chasm/lib/activity/activity.go), which scenario force-complete-paused covers on its own.
+  4. the operator raises maximum_attempts and unpauses, so LEDGER_ATTEMPT -- which exists only
+     because of that intervention -- resumes from the checkpoint.
+  5. it does its chunks, waits for its last heartbeat to reach the server, then goes quiet. The
+     ledger heartbeats by ID to correct the checkpoint *backwards* to RECONCILED_CHECKPOINT -- it
+     knows what is really committed -- and only then does the attempt die, so HANDOFF_ATTEMPT must
+     resume from the ledger's number rather than the worker's.
+  6. HANDOFF_ATTEMPT does its chunks and hands itself off with raise_complete_async, leaving the
+     Activity running with no worker managing it, and the ledger closes it by ID. How it closes
+     is the scenario:
+
+       complete-by-id          completes it with a result.
+       fail-by-id              fails it non-retryably, so it does not retry despite having
+                               attempts left.
+       cancel-by-id            requests cancellation, then reports the cancellation by ID.
+                               Reporting it without a pending request is rejected
+                               (ErrActivityTaskNotCancelRequested), so both calls are needed.
+       force-complete-paused   stops after act 3 and completes the paused Activity by ID, with
+                               no attempt in progress at all.
+
+Usage:
+  ./temporal-workload-saa-kitchen-sink
+
+Requires history.enableStandaloneActivityOperatorCommands=true for the pause, unpause and
+update-options calls.
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import asyncio
+import logging
+import os
+import sys
+import time
+import uuid
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+from google.protobuf.field_mask_pb2 import FieldMask
+from temporalio import activity
+from temporalio.api.activity.v1 import ActivityOptions
+from temporalio.api.common.v1 import Payloads
+from temporalio.api.common.v1 import RetryPolicy as RetryPolicyProto
+from temporalio.api.enums.v1 import ActivityExecutionStatus, PendingActivityState
+from temporalio.api.workflowservice.v1 import (
+    DescribeActivityExecutionRequest,
+    PauseActivityExecutionRequest,
+    UnpauseActivityExecutionRequest,
+    UpdateActivityExecutionOptionsRequest,
+)
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.service import RPCError, RPCStatusCode
+from temporalio.worker import Worker
+
+ACTIVITY_TYPE = "KitchenSinkChunkedJob"
+TASK_QUEUE = "saa-kitchen-sink-tq"
+ACTIVITY_ID_PREFIX = "saa-kitchen-sink"
+
+CHUNKS_PER_ATTEMPT = 4
+CHUNK_SECONDS = 0.3
+INITIAL_MAX_ATTEMPTS = 3
+RAISED_MAX_ATTEMPTS = 5
+# Which attempt plays which part. The operator intervenes while the job still has a retry left,
+# and raising maximum_attempts is what lets it reach HANDOFF_ATTEMPT, which the initial policy
+# would never have permitted. Intervening one attempt later, on the last attempt the initial
+# policy permits, is a different case with its own hazard, covered by
+# temporal-workload-activity-grant-retries: pausing there ends the Activity outright on SAA
+# (PAUSE_REQUESTED is only honoured below the retry-policy gate in tryReschedule), while WFA parks
+# it, so there is nothing left to grant retries to.
+OPERATOR_ATTEMPT = INITIAL_MAX_ATTEMPTS - 1
+LEDGER_ATTEMPT = OPERATOR_ATTEMPT + 1
+HANDOFF_ATTEMPT = LEDGER_ATTEMPT + 1
+# What the ledger says is really committed when it corrects the checkpoint in act 5. Behind the
+# worker's own progress, which is the point: the correction has to win.
+RECONCILED_CHECKPOINT = (LEDGER_ATTEMPT - 1) * CHUNKS_PER_ATTEMPT + 1
+
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
+# Generous: acts 5 and 6 both leave the Activity with nobody heartbeating for it, and a heartbeat
+# timeout there would retry the attempt out from under the act.
+HEARTBEAT_TIMEOUT = timedelta(seconds=20)
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+INITIAL_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=INITIAL_MAX_ATTEMPTS,
+    initial_interval=timedelta(seconds=1),
+    backoff_coefficient=1.0,
+)
+
+POLL_INTERVAL = 0.2
+PATIENCE = 40.0
+
+COMPLETE_BY_ID = "complete-by-id"
+FAIL_BY_ID = "fail-by-id"
+CANCEL_BY_ID = "cancel-by-id"
+FORCE_COMPLETE_PAUSED = "force-complete-paused"
+SCENARIOS = (COMPLETE_BY_ID, FAIL_BY_ID, CANCEL_BY_ID, FORCE_COMPLETE_PAUSED)
+
+# Points in the Activity where it stops and waits for the driver.
+HELD_FOR_OPERATOR = "held for the operator"
+QUIET_FOR_LEDGER = "quiet for the ledger"
+HANDED_OFF = "handed off to the ledger"
+
+LEDGER_RESULT = "closed by the ledger"
+LEDGER_FAILURE = "the ledger says this job can never succeed"
+LEDGER_CANCELLATION = "the ledger withdrew the job"
+
+
+@dataclass(frozen=True)
+class Observation:
+    """The server's view of the Activity."""
+
+    state: str
+    attempt: int
+    max_attempts: int
+    checkpoint: int | None
+    closed: bool
+
+    def __str__(self) -> str:
+        return (
+            f"state={self.state} attempt={self.attempt} "
+            f"maximum_attempts={self.max_attempts} checkpoint={self.checkpoint}"
+        )
+
+
+@dataclass
+class Attempt:
+    attempt: int
+    resumed_from: int
+    outcome: str = "in progress"
+
+
+@dataclass
+class Run:
+    """One scenario, and the single Activity it drives."""
+
+    scenario: str
+    activity_id: str
+    run_id: str = ""
+    attempts: list[Attempt] = field(default_factory=list)
+    acts: list[str] = field(default_factory=list)
+    result: str | None = None
+    failure: str | None = None
+    findings: list[str] = field(default_factory=list)
+    reached: dict[str, asyncio.Event] = field(
+        default_factory=lambda: defaultdict(asyncio.Event)
+    )
+    proceed: dict[str, asyncio.Event] = field(
+        default_factory=lambda: defaultdict(asyncio.Event)
+    )
+
+    def act(self, message: str) -> None:
+        self.acts.append(message)
+        log(self, message)
+
+
+RUNS: dict[str, Run] = {}
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def chunked_job() -> str:
+    info = activity.info()
+    run = RUNS[info.activity_id]
+    resumed_from = info.heartbeat_details[0] if info.heartbeat_details else 0
+    record = Attempt(attempt=info.attempt, resumed_from=resumed_from)
+    run.attempts.append(record)
+    log(run, f"attempt {info.attempt}: resuming from chunk {resumed_from}")
+
+    chunk = resumed_from
+    try:
+        for _ in range(CHUNKS_PER_ATTEMPT):
+            await asyncio.sleep(CHUNK_SECONDS)
+            chunk += 1
+            activity.heartbeat(chunk)
+
+        if info.attempt < OPERATOR_ATTEMPT:
+            record.outcome = f"died after chunk {chunk}"
+            raise ApplicationError(f"worker died after chunk {chunk}")
+
+        if info.attempt == OPERATOR_ATTEMPT:
+            record.outcome = f"held at chunk {chunk} for the operator"
+            await hold_heartbeating(run, HELD_FOR_OPERATOR, chunk)
+            record.outcome = f"released at chunk {chunk}, dying"
+            raise ApplicationError(f"worker died after chunk {chunk}")
+
+        if info.attempt == LEDGER_ATTEMPT:
+            # Make sure the worker's own last heartbeat has landed before going quiet, so a
+            # throttled one cannot arrive after the ledger's correction and undo it.
+            await await_server_checkpoint(run, chunk)
+            record.outcome = f"went quiet at chunk {chunk} for the ledger"
+            await hold_quietly(run, QUIET_FOR_LEDGER)
+            record.outcome = f"died at chunk {chunk} after the ledger's correction"
+            raise ApplicationError(f"worker died after chunk {chunk}")
+
+        record.outcome = f"handed off at chunk {chunk}"
+        log(run, f"attempt {info.attempt}: handing off at chunk {chunk}")
+        run.reached[HANDED_OFF].set()
+        activity.raise_complete_async()
+    except asyncio.CancelledError:
+        record.outcome = (
+            f"cancelled at chunk {chunk} ({activity.cancellation_details()})"
+        )
+        log(run, f"attempt {info.attempt}: {record.outcome}")
+        raise
+    return f"worker finished at chunk {chunk}"
+
+
+async def hold_heartbeating(run: Run, name: str, chunk: int) -> None:
+    """Keep the attempt alive and visibly running until the driver releases it."""
+    run.reached[name].set()
+    while not run.proceed[name].is_set():
+        activity.heartbeat(chunk)
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def hold_quietly(run: Run, name: str) -> None:
+    """Keep the attempt alive without heartbeating, so whatever the driver records as the
+    checkpoint stays the checkpoint."""
+    run.reached[name].set()
+    await run.proceed[name].wait()
+
+
+async def await_server_checkpoint(run: Run, chunk: int) -> None:
+    info = activity.info()
+    deadline = time.monotonic() + PATIENCE
+    while (await observe(activity.client(), run)).checkpoint != chunk:
+        if time.monotonic() > deadline:
+            raise ApplicationError(
+                f"attempt {info.attempt} heartbeated chunk {chunk} but the server never "
+                f"reported it",
+                non_retryable=True,
+            )
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def observe(client: Client, run: Run) -> Observation:
+    response = await client.workflow_service.describe_activity_execution(
+        DescribeActivityExecutionRequest(
+            namespace=client.namespace,
+            activity_id=run.activity_id,
+            run_id=run.run_id,
+            include_heartbeat_details=True,
+        )
+    )
+    info = response.info
+    closed = info.status not in (
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_RUNNING,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_PAUSED,
+    )
+    if closed:
+        state = ActivityExecutionStatus.Name(info.status).removeprefix(
+            "ACTIVITY_EXECUTION_STATUS_"
+        )
+    else:
+        state = PendingActivityState.Name(info.run_state).removeprefix(
+            "PENDING_ACTIVITY_STATE_"
+        )
+    return Observation(
+        state=state,
+        attempt=info.attempt,
+        max_attempts=info.retry_policy.maximum_attempts,
+        checkpoint=await checkpoint_of(client, info.heartbeat_details),
+        closed=closed,
+    )
+
+
+async def checkpoint_of(client: Client, details: Payloads) -> int | None:
+    if not details.payloads:
+        return None
+    decoded = await client.data_converter.decode(details.payloads)
+    return decoded[0] if decoded else None
+
+
+async def wait_until(
+    client: Client,
+    run: Run,
+    predicate: Callable[[Observation], bool],
+    what: str,
+) -> Observation:
+    """Poll the server until predicate holds, the Activity closes, or patience runs out. A closed
+    Activity ends the wait because in this narrative it is always a finding."""
+    deadline = time.monotonic() + PATIENCE
+    while True:
+        observation = await observe(client, run)
+        if predicate(observation) or observation.closed:
+            return observation
+        if time.monotonic() > deadline:
+            run.findings.append(
+                f"timed out after {PATIENCE}s waiting for {what}: {observation}"
+            )
+            return observation
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def reached(run: Run, name: str) -> bool:
+    """Wait for the Activity to reach one of its holding points."""
+    try:
+        await asyncio.wait_for(run.reached[name].wait(), PATIENCE)
+    except TimeoutError:
+        run.findings.append(f"the Activity never reached the point where it is {name}")
+        return False
+    return True
+
+
+def ledger(client: Client, run: Run):
+    """A handle on the Activity as the ledger sees it: by ID, with no task token."""
+    return client.get_async_activity_handle(
+        activity_id=run.activity_id, run_id=run.run_id
+    )
+
+
+async def try_call(what: str, call: Awaitable[object]) -> str:
+    try:
+        await call
+    except RPCError as err:
+        return f"{what} rejected ({err.status.name}: {err.message})"
+    return f"{what} accepted"
+
+
+async def drive(client: Client, run: Run) -> None:
+    if not await reached(run, HELD_FOR_OPERATOR):
+        return
+    observation = await wait_until(
+        client,
+        run,
+        lambda o: o.state == "STARTED" and o.attempt == OPERATOR_ATTEMPT,
+        "the attempt the operator intervenes on to be running",
+    )
+    run.act(f"operator finds the job stuck, going nowhere: {observation}")
+
+    await pause(client, run)
+    observation = await wait_until(
+        client,
+        run,
+        lambda o: o.state == "PAUSED",
+        "the paused Activity to come to rest",
+    )
+    run.act(f"operator paused it and the attempt yielded: {observation}")
+    if observation.state != "PAUSED":
+        run.findings.append(f"pausing left the Activity in {observation.state}")
+        return
+
+    if run.scenario == FORCE_COMPLETE_PAUSED:
+        run.act(
+            "ledger completes the paused Activity by ID, with no attempt in progress: "
+            + await try_call("complete", ledger(client, run).complete(LEDGER_RESULT))
+        )
+        return
+
+    for what, call in (
+        ("heartbeat", ledger(client, run).heartbeat(RECONCILED_CHECKPOINT)),
+        ("fail", ledger(client, run).fail(ApplicationError("ledger says no"))),
+        ("cancel", ledger(client, run).report_cancellation("ledger says no")),
+    ):
+        outcome = await try_call(what, call)
+        run.act(f"with no attempt in progress, by-ID {outcome}")
+        if "accepted" in outcome:
+            run.findings.append(
+                f"by-ID {what} was accepted with no attempt in progress; only completion "
+                f"is supposed to be"
+            )
+
+    await raise_max_attempts(client, run)
+    observation = await observe(client, run)
+    run.act(f"operator raised maximum_attempts: {observation}")
+    if observation.max_attempts != RAISED_MAX_ATTEMPTS:
+        run.findings.append(
+            f"server reports maximum_attempts={observation.max_attempts} after it was raised "
+            f"to {RAISED_MAX_ATTEMPTS}"
+        )
+    await unpause(client, run)
+    run.proceed[HELD_FOR_OPERATOR].set()
+    run.act(f"operator unpaused it: {await observe(client, run)}")
+
+    if not await reached(run, QUIET_FOR_LEDGER):
+        return
+    before = await observe(client, run)
+    run.act(
+        f"attempt reached chunk {before.checkpoint} and went quiet; ledger corrects the "
+        f"checkpoint to {RECONCILED_CHECKPOINT} by ID: "
+        + await try_call(
+            "heartbeat", ledger(client, run).heartbeat(RECONCILED_CHECKPOINT)
+        )
+    )
+    corrected = await observe(client, run)
+    if corrected.checkpoint != RECONCILED_CHECKPOINT:
+        run.findings.append(
+            f"server reports checkpoint {corrected.checkpoint} after the ledger set it to "
+            f"{RECONCILED_CHECKPOINT}"
+        )
+    run.proceed[QUIET_FOR_LEDGER].set()
+
+    if not await reached(run, HANDED_OFF):
+        return
+    await finale(client, run)
+
+
+async def finale(client: Client, run: Run) -> None:
+    """The ledger closes an Activity that no worker is managing any more."""
+    if run.scenario == COMPLETE_BY_ID:
+        run.act(
+            "ledger completes it by ID: "
+            + await try_call("complete", ledger(client, run).complete(LEDGER_RESULT))
+        )
+        return
+    if run.scenario == FAIL_BY_ID:
+        run.act(
+            "ledger fails it non-retryably by ID: "
+            + await try_call(
+                "fail",
+                ledger(client, run).fail(
+                    ApplicationError(LEDGER_FAILURE, non_retryable=True)
+                ),
+            )
+        )
+        return
+
+    outcome = await try_call(
+        "report_cancellation",
+        ledger(client, run).report_cancellation(LEDGER_CANCELLATION),
+    )
+    run.act(f"with no cancellation requested, by-ID {outcome}")
+    if "accepted" in outcome:
+        run.findings.append(
+            "by-ID report_cancellation was accepted with no cancellation requested"
+        )
+    await client.get_activity_handle(run.activity_id, run_id=run.run_id).cancel(
+        reason="ledger withdrew the job"
+    )
+    observation = await wait_until(
+        client,
+        run,
+        lambda o: o.state == "CANCEL_REQUESTED",
+        "the cancellation request to be recorded",
+    )
+    run.act(f"ledger requested cancellation: {observation}")
+    run.act(
+        "ledger reports the cancellation by ID: "
+        + await try_call(
+            "report_cancellation",
+            ledger(client, run).report_cancellation(LEDGER_CANCELLATION),
+        )
+    )
+
+
+async def raise_max_attempts(client: Client, run: Run) -> None:
+    await operator_command(
+        client.workflow_service.update_activity_execution_options(
+            UpdateActivityExecutionOptionsRequest(
+                namespace=client.namespace,
+                activity_id=run.activity_id,
+                run_id=run.run_id,
+                identity=client.identity,
+                activity_options=ActivityOptions(
+                    retry_policy=RetryPolicyProto(maximum_attempts=RAISED_MAX_ATTEMPTS)
+                ),
+                update_mask=FieldMask(paths=["retry_policy.maximum_attempts"]),
+            )
+        )
+    )
+
+
+async def pause(client: Client, run: Run) -> None:
+    await operator_command(
+        client.workflow_service.pause_activity_execution(
+            PauseActivityExecutionRequest(
+                namespace=client.namespace,
+                activity_id=run.activity_id,
+                run_id=run.run_id,
+                identity=client.identity,
+                reason="saa-kitchen-sink workload",
+                request_id=str(uuid.uuid4()),
+            )
+        )
+    )
+
+
+async def unpause(client: Client, run: Run) -> None:
+    await operator_command(
+        client.workflow_service.unpause_activity_execution(
+            UnpauseActivityExecutionRequest(
+                namespace=client.namespace,
+                activity_id=run.activity_id,
+                run_id=run.run_id,
+                identity=client.identity,
+                reason="saa-kitchen-sink workload",
+            )
+        )
+    )
+
+
+async def operator_command(command: Awaitable[object]) -> None:
+    """Await an operator command, saying what to turn on if the server does not have Standalone
+    Activity operator commands enabled."""
+    try:
+        await command
+    except RPCError as err:
+        if err.status != RPCStatusCode.UNIMPLEMENTED:
+            raise
+        sys.exit(
+            f"{err.message}: start the server with "
+            "history.enableStandaloneActivityOperatorCommands=true"
+        )
+
+
+async def collect_outcome(run: Run, result: Awaitable[str]) -> None:
+    try:
+        run.result = await result
+        log(run, f"result: {run.result}")
+    except Exception as err:  # noqa: BLE001 -- however it ends is the thing being reported
+        run.failure = failure_chain(err)
+        log(run, f"failed: {run.failure}")
+
+
+def failure_chain(err: BaseException) -> str:
+    """The whole chain, not just the outermost error: what the ledger said is the innermost cause,
+    and the outermost is only ever "Activity execution failed"."""
+    parts: list[str] = []
+    current: BaseException | None = err
+    while current is not None:
+        parts.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__
+    return " <- ".join(parts)
+
+
+async def execute(client: Client, scenario: str) -> Run:
+    run = Run(
+        scenario=scenario,
+        activity_id=f"{ACTIVITY_ID_PREFIX}-{scenario}-{uuid.uuid4().hex[:8]}",
+    )
+    RUNS[run.activity_id] = run
+    handle = await client.start_activity(
+        chunked_job,
+        id=run.activity_id,
+        task_queue=TASK_QUEUE,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=INITIAL_RETRY_POLICY,
+    )
+    run.run_id = handle.run_id or ""
+    log(run, f"started activity {run.activity_id}")
+    await asyncio.gather(collect_outcome(run, handle.result()), drive(client, run))
+    run.act(f"final state: {await observe(client, run)}")
+    return run
+
+
+def expected_attempts(scenario: str) -> list[tuple[int, int]]:
+    """(attempt, chunk it resumed from). Every attempt resumes from the previous one's chunks
+    except the last, which resumes from the ledger's correction rather than from the worker's own
+    last heartbeat -- the whole point of act 5."""
+    plan = [
+        (attempt, (attempt - 1) * CHUNKS_PER_ATTEMPT)
+        for attempt in range(1, LEDGER_ATTEMPT + 1)
+    ] + [(HANDOFF_ATTEMPT, RECONCILED_CHECKPOINT)]
+    return plan[:OPERATOR_ATTEMPT] if scenario == FORCE_COMPLETE_PAUSED else plan
+
+
+def problems(run: Run) -> list[str]:
+    found = list(run.findings)
+    observed = [(record.attempt, record.resumed_from) for record in run.attempts]
+    expected = expected_attempts(run.scenario)
+    if observed != expected:
+        found.append(
+            f"expected attempts (attempt, resumed from) {expected}, worker saw {observed}"
+        )
+    if run.scenario in (COMPLETE_BY_ID, FORCE_COMPLETE_PAUSED):
+        if run.result != LEDGER_RESULT:
+            found.append(
+                f"expected the ledger's result {LEDGER_RESULT!r}, got result {run.result!r} "
+                f"failure {run.failure!r}"
+            )
+    elif run.scenario == FAIL_BY_ID:
+        if run.failure is None or LEDGER_FAILURE not in run.failure:
+            found.append(
+                f"expected the ledger's failure {LEDGER_FAILURE!r}, got result {run.result!r} "
+                f"failure {run.failure!r}"
+            )
+    elif run.failure is None or "CancelledError" not in run.failure:
+        found.append(
+            f"expected a cancellation, got result {run.result!r} failure {run.failure!r}"
+        )
+    return found
+
+
+def report(run: Run) -> bool:
+    log(run, "")
+    log(run, f"{'attempt':>8}  {'resumed from':>12}  outcome")
+    for record in run.attempts:
+        log(run, f"{record.attempt:>8}  {record.resumed_from:>12}  {record.outcome}")
+    found = problems(run)
+    for problem in found:
+        log(run, f"UNEXPECTED: {problem}")
+    if not found:
+        log(run, "the whole narrative behaved as described")
+    return not found
+
+
+def log(run: Run, message: str) -> None:
+    print(f"{run.scenario:>22}  {message}" if message else "", flush=True)
+
+
+async def main() -> None:
+    # Most attempts fail by design; the worker logs each with a traceback, which would bury the
+    # report.
+    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        activities=[chunked_job],
+        # Keep heartbeats flowing to the server promptly: the default throttle is
+        # 0.8 * heartbeat_timeout, which every act that waits on a checkpoint would sit through.
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    async with worker:
+        runs = await asyncio.gather(
+            *(execute(client, scenario) for scenario in SCENARIOS)
+        )
+
+    for run in runs:
+        log(run, "")
+        for act in run.acts:
+            log(run, f"  {act}")
+    if not all(report(run) for run in runs):
+        sys.exit("the Standalone Activity API surface did not behave as described")
+    print("every scenario behaved as described", flush=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
