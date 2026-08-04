@@ -20,21 +20,26 @@ The Activity being reset is a Workflow Activity. Standalone Activities are not c
 their heartbeat details needs DescribeActivityExecution's include_heartbeat_details, and
 `temporal activity describe` has no flag for it, so there is nothing to compare.
 
+Each flag mode is run against both states an Activity can be in when the reset arrives, because
+they are not equivalent:
+
+  backing off  no attempt is running, so the reset applies immediately.
+  running      an attempt is running, so the reset only lands when that attempt next heartbeats,
+               and what it does to the attempt counter has to survive whatever happens to the
+               attempt it interrupts.
+
 How each case runs. The Activity heartbeats a checkpoint and dies once, so the reset lands on an
-Activity that is demonstrably past attempt 1 with a checkpoint the server holds:
+Activity demonstrably past attempt 1 with a checkpoint the server holds:
 
-  1. start #1 heartbeats up to CHECKPOINT and fails, putting the Activity on attempt 2.
-  2. start #2 resumes from CHECKPOINT and holds there, heartbeating, so the Activity sits
-     visibly STARTED on attempt 2 with heartbeat details the CLI can read.
+  1. the first start heartbeats up to CHECKPOINT and fails, asking for a BACKOFF-long delay
+     before the second attempt, which is the window the backing-off cases reset in.
+  2. for the running cases, the second start resumes from CHECKPOINT and holds there,
+     heartbeating, so the Activity is visibly running with heartbeat details the CLI can read.
   3. the CLI resets it, with or without --reset-heartbeats.
-  4. start #3 -- the attempt the reset produced -- records what it was handed and then waits,
-     heartbeating nothing, so the CLI can read the post-reset state before anything overwrites
-     it. The attempt counter must be back to 1 in both cases; the heartbeat details must be
-     unchanged without the flag and gone with it.
-
-Note this CLI also has a separate --reset-attempts flag, which sits oddly with a plain reset
-being expected to reset the attempt counter on its own. The expectation asserted here is the
-stated behaviour, so if a bare reset leaves the counter alone, that is the finding.
+  4. the start the reset produces records what it was handed and then waits, heartbeating
+     nothing, so the CLI can read the post-reset state before anything overwrites it. The attempt
+     counter must be back to 1 in every case; the heartbeat details must be unchanged without the
+     flag and gone with it.
 
 Usage:
   ./temporal-workload-activity-reset-heartbeat
@@ -78,9 +83,17 @@ RETRY_POLICY = RetryPolicy(
 )
 
 PATIENCE = 60.0
-DEFAULT = "reset"
-RESET_HEARTBEATS = "reset --reset-heartbeats"
-CASES = {DEFAULT: [], RESET_HEARTBEATS: ["--reset-heartbeats"]}
+# How long the Activity asks the server to wait before its second attempt, giving the driver a
+# window in which to reset an Activity that has no attempt running.
+BACKOFF = timedelta(seconds=10)
+
+BACKING_OFF = "backing off"
+RUNNING = "running"
+CASES = [
+    (state, flags)
+    for state in (BACKING_OFF, RUNNING)
+    for flags in ([], ["--reset-heartbeats"])
+]
 
 ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
@@ -93,7 +106,8 @@ if not CLI:
 class Run:
     """One case: one workflow, one Activity, one reset."""
 
-    case: str
+    state: str
+    flags: list[str]
     workflow_id: str
     starts: int = 0
     # What each start of the Activity was handed to resume from, in order.
@@ -131,7 +145,9 @@ async def checkpointed_job(workflow_id: str) -> str:
         for chunk in range(1, CHECKPOINT + 1):
             await asyncio.sleep(CHUNK_SECONDS)
             activity.heartbeat(chunk)
-        raise ApplicationError(f"worker died after chunk {CHECKPOINT}")
+        raise ApplicationError(
+            f"worker died after chunk {CHECKPOINT}", next_retry_delay=BACKOFF
+        )
 
     if run.reset_issued:
         # The attempt the reset produced. Say nothing until the CLI has read the state, so the
@@ -220,24 +236,31 @@ async def until(
         await asyncio.sleep(0.2)
 
 
-async def drive(run: Run, flags: list[str]) -> None:
+async def drive(run: Run) -> None:
     def check(condition: bool, message: str) -> None:
         if not condition:
             run.findings.append(message)
         log(run, f"{'PASS' if condition else 'FAIL'}  {message}")
 
-    try:
-        await asyncio.wait_for(run.holding.wait(), PATIENCE)
-    except TimeoutError:
-        run.findings.append(
-            f"the Activity never got past its first attempt within {PATIENCE}s"
-        )
-        return
+    if run.state == RUNNING:
+        try:
+            await asyncio.wait_for(run.holding.wait(), PATIENCE)
+        except TimeoutError:
+            run.findings.append(
+                f"the Activity never got past its first attempt within {PATIENCE}s"
+            )
+            return
     if not await until(
         run,
-        "the Activity to be running its second attempt with a checkpoint",
+        f"the Activity to be {run.state} on its second attempt with a checkpoint",
         lambda p: p is not None and p.attempt == 2 and p.heartbeat_details is not None,
     ):
+        return
+    if run.state == BACKING_OFF and run.holding.is_set():
+        run.findings.append(
+            f"the second attempt started before it could be reset while backing off; "
+            f"{BACKOFF} was not long enough"
+        )
         return
     before = await asyncio.to_thread(describe, run)
     assert before is not None
@@ -252,9 +275,9 @@ async def drive(run: Run, flags: list[str]) -> None:
         run.workflow_id,
         "--activity-id",
         before.activity_id,
-        *flags,
+        *run.flags,
     )
-    log(run, f"ran: temporal activity {' '.join(['reset', *flags])}")
+    log(run, f"ran: temporal activity {' '.join(['reset', *run.flags])}")
 
     try:
         await asyncio.wait_for(run.reset_attempt_began.wait(), PATIENCE)
@@ -268,7 +291,7 @@ async def drive(run: Run, flags: list[str]) -> None:
     log(run, f"after the reset: {after}")
 
     check(after.attempt == 1, f"attempt counter is {after.attempt}, want 1")
-    if flags:
+    if run.flags:
         check(
             after.heartbeat_details is None,
             f"heartbeat details are {after.heartbeat_details}, want them discarded",
@@ -290,8 +313,12 @@ async def drive(run: Run, flags: list[str]) -> None:
     run.may_heartbeat.set()
 
 
-async def execute(case: str, flags: list[str]) -> Run:
-    run = Run(case=case, workflow_id=f"reset-heartbeat-{uuid.uuid4().hex[:8]}")
+async def execute(state: str, flags: list[str]) -> Run:
+    run = Run(
+        state=state,
+        flags=flags,
+        workflow_id=f"reset-heartbeat-{uuid.uuid4().hex[:8]}",
+    )
     RUNS[run.workflow_id] = run
     log(run, "")
     await asyncio.to_thread(
@@ -309,7 +336,7 @@ async def execute(case: str, flags: list[str]) -> Run:
     )
     log(run, f"started workflow {run.workflow_id}")
     try:
-        await drive(run, flags)
+        await drive(run)
     finally:
         run.may_heartbeat.set()
         await asyncio.to_thread(
@@ -324,8 +351,13 @@ async def execute(case: str, flags: list[str]) -> Run:
     return run
 
 
+def case(state: str, flags: list[str]) -> str:
+    return f"{state} / {' '.join(['reset', *flags])}"
+
+
 def log(run: Run, message: str) -> None:
-    print(f"{run.case:>24}  {message}" if message else "", flush=True)
+    label = case(run.state, run.flags)
+    print(f"{label:>40}  {message}" if message else "", flush=True)
 
 
 async def main() -> None:
@@ -346,12 +378,16 @@ async def main() -> None:
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
     )
     async with worker:
-        runs = [await execute(case, flags) for case, flags in CASES.items()]
+        runs = [await execute(state, flags) for state, flags in CASES]
 
-    failed = [(run.case, finding) for run in runs for finding in run.findings]
+    failed = [
+        (case(run.state, run.flags), finding)
+        for run in runs
+        for finding in run.findings
+    ]
     print(flush=True)
-    for case, finding in failed:
-        print(f"UNEXPECTED  {case}: {finding}", flush=True)
+    for label, finding in failed:
+        print(f"UNEXPECTED  {label}: {finding}", flush=True)
     if failed:
         sys.exit("reset did not treat the heartbeat details as described")
     print(
