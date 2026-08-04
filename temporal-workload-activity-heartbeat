@@ -5,9 +5,11 @@
 # dependencies = ["temporalio"]
 # ///
 """
-Exercise Activity heartbeating: one long-running heartbeating Activity inside a Workflow,
-failing several attempts before succeeding, where each failure reports its own heartbeat
-payload that is deliberately *behind* the last payload heartbeated during that attempt.
+Exercise Activity heartbeating on both product surfaces that use the Activity CHASM
+component -- a Workflow Activity (WFA) and a Standalone Activity (SAA) -- with one
+long-running heartbeating Activity per surface, failing several attempts before succeeding,
+where each failure reports its own heartbeat payload that is deliberately *behind* the last
+payload heartbeated during that attempt.
 
 The Activity processes CHUNKS_TOTAL chunks and heartbeats its per-chunk progress. Chunks are
 only durable at COMMITTED_BATCH_SIZE boundaries, so when an attempt dies it must tell the
@@ -22,11 +24,14 @@ failed (sdk-core#293), so the only way to set it from Python is the async-comple
 API: the Activity fails its own task through Client.get_async_activity_handle(...).fail() and
 then raises CompleteAsyncError so the worker keeps quiet.
 
-Before failing, each attempt waits until DescribeWorkflowExecution shows the server holding
-its latest per-chunk heartbeat (core throttles heartbeats to 0.8 * heartbeat_timeout, so the
-last activity.heartbeat() call is not necessarily on the wire). That is what makes the
+Before failing, each attempt waits until the server is observed holding its latest per-chunk
+heartbeat (core throttles heartbeats to 0.8 * heartbeat_timeout, so the last
+activity.heartbeat() call is not necessarily on the wire). That is what makes the
 demonstration a proof rather than a coincidence: the next attempt resumes from the failure's
-payload even though the server had a later payload from an ordinary heartbeat.
+payload even though the server had a later payload from an ordinary heartbeat. WFA progress
+is read from DescribeWorkflowExecution's pending activities; SAA progress from
+DescribeActivityExecution, which requires include_heartbeat_details and so is issued as a raw
+RPC rather than through ActivityHandle.describe().
 
 Usage:
   ./temporal-workload-activity-heartbeat
@@ -42,11 +47,12 @@ import itertools
 import os
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import NoReturn
 
 from temporalio import activity, workflow
+from temporalio.api.workflowservice.v1 import DescribeActivityExecutionRequest
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
@@ -61,7 +67,14 @@ COMMITTED_BATCH_SIZE = 4
 CHUNKS_PER_ATTEMPT = 5
 CHUNK_SECONDS = 0.5
 SUCCEED_ON_ATTEMPT = 4
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
 HEARTBEAT_TIMEOUT = timedelta(seconds=5)
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+RETRY_POLICY = RetryPolicy(
+    maximum_attempts=SUCCEED_ON_ATTEMPT,
+    initial_interval=timedelta(seconds=1),
+    backoff_coefficient=1.0,
+)
 
 
 @dataclass
@@ -72,33 +85,48 @@ class Attempt:
     reported_checkpoint: int | None = None
 
 
-ATTEMPTS: list[Attempt] = []
+@dataclass
+class Surface:
+    """One of the two product surfaces backed by the Activity CHASM component."""
+
+    name: str
+    attempts: list[Attempt] = field(default_factory=list)
+
+
+WFA = Surface("WFA")
+SAA = Surface("SAA")
 
 
 @activity.defn(name=ACTIVITY_TYPE)
 async def process_chunks() -> str:
     info = activity.info()
+    surface = WFA if info.in_workflow else SAA
     resumed_from = info.heartbeat_details[0] if info.heartbeat_details else 0
     record = Attempt(attempt=info.attempt, resumed_from=resumed_from)
-    ATTEMPTS.append(record)
-    log(f"attempt {info.attempt}: resuming from chunk {resumed_from}")
+    surface.attempts.append(record)
+    log(f"{surface.name} attempt {info.attempt}: resuming from chunk {resumed_from}")
 
     chunk = resumed_from
     while chunk < CHUNKS_TOTAL:
         await asyncio.sleep(CHUNK_SECONDS)
         chunk += 1
         activity.heartbeat(chunk)
-        log(f"attempt {info.attempt}: processed chunk {chunk}, heartbeated {chunk}")
+        log(
+            f"{surface.name} attempt {info.attempt}: processed chunk {chunk}, "
+            f"heartbeated {chunk}"
+        )
         if (
             info.attempt < SUCCEED_ON_ATTEMPT
             and chunk - resumed_from >= CHUNKS_PER_ATTEMPT
         ):
-            await fail_at_committed_checkpoint(record, chunk)
-    log(f"attempt {info.attempt}: all {CHUNKS_TOTAL} chunks processed")
+            await fail_at_committed_checkpoint(surface, record, chunk)
+    log(f"{surface.name} attempt {info.attempt}: all {CHUNKS_TOTAL} chunks processed")
     return f"processed {CHUNKS_TOTAL} chunks"
 
 
-async def fail_at_committed_checkpoint(record: Attempt, chunk: int) -> NoReturn:
+async def fail_at_committed_checkpoint(
+    surface: Surface, record: Attempt, chunk: int
+) -> NoReturn:
     """Fail this attempt, reporting the last committed batch boundary rather than the
     per-chunk progress the server has already seen heartbeated."""
     info = activity.info()
@@ -107,8 +135,8 @@ async def fail_at_committed_checkpoint(record: Attempt, chunk: int) -> NoReturn:
     committed = chunk - chunk % COMMITTED_BATCH_SIZE
     record.reported_checkpoint = committed
     log(
-        f"attempt {info.attempt}: failing; server heartbeat progress is {chunk}, "
-        f"failing with last_heartbeat_details=[{committed}]"
+        f"{surface.name} attempt {info.attempt}: failing; server heartbeat progress is "
+        f"{chunk}, failing with last_heartbeat_details=[{committed}]"
     )
     await (
         activity.client()
@@ -122,26 +150,41 @@ async def fail_at_committed_checkpoint(record: Attempt, chunk: int) -> NoReturn:
 
 
 async def await_server_progress(chunk: int) -> None:
-    """Block until the server has recorded chunk as this Activity's heartbeat progress.
-    Heartbeats are throttled by core, so re-heartbeat while waiting for one to be sent."""
+    """Block until the server has recorded chunk as this Activity's heartbeat progress. Do not
+    heartbeat while waiting: a heartbeat recorded after the one we are waiting for would leave
+    throttled details pending in the worker, which could reach the server after the failure and
+    confound the demonstration."""
     while await server_progress() != chunk:
-        activity.heartbeat(chunk)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
 
 async def server_progress() -> int | None:
     info = activity.info()
     client = activity.client()
-    description = await client.get_workflow_handle(
-        info.workflow_id, run_id=info.workflow_run_id
-    ).describe()
-    for pending in description.raw_description.pending_activities:
-        if pending.activity_id == info.activity_id:
-            details = await client.data_converter.decode(
+    if info.in_workflow:
+        description = await client.get_workflow_handle(
+            info.workflow_id or "", run_id=info.workflow_run_id
+        ).describe()
+        details = next(
+            (
                 pending.heartbeat_details.payloads
+                for pending in description.raw_description.pending_activities
+                if pending.activity_id == info.activity_id
+            ),
+            None,
+        )
+    else:
+        response = await client.workflow_service.describe_activity_execution(
+            DescribeActivityExecutionRequest(
+                namespace=info.namespace,
+                activity_id=info.activity_id,
+                run_id=info.activity_run_id or "",
+                include_heartbeat_details=True,
             )
-            return details[0] if details else None
-    return None
+        )
+        details = response.info.heartbeat_details.payloads
+    decoded = await client.data_converter.decode(details) if details else []
+    return decoded[0] if decoded else None
 
 
 @workflow.defn(name=WORKFLOW_TYPE)
@@ -150,13 +193,9 @@ class HeartbeatWorkload:
     async def run(self) -> str:
         return await workflow.execute_activity(
             ACTIVITY_TYPE,
-            start_to_close_timeout=timedelta(minutes=2),
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
             heartbeat_timeout=HEARTBEAT_TIMEOUT,
-            retry_policy=RetryPolicy(
-                maximum_attempts=SUCCEED_ON_ATTEMPT,
-                initial_interval=timedelta(seconds=1),
-                backoff_coefficient=1.0,
-            ),
+            retry_policy=RETRY_POLICY,
         )
 
 
@@ -164,38 +203,65 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
-def report() -> bool:
+def report(surface: Surface) -> bool:
     log("")
-    log(f"{'attempt':>8}  {'resumed from':>12}  {'server saw':>10}  {'reported':>8}")
-    for record in ATTEMPTS:
+    log(
+        f"{surface.name}  {'attempt':>8}  {'resumed from':>12}  {'server saw':>10}  "
+        f"{'reported':>8}"
+    )
+    for record in surface.attempts:
         log(
-            f"{record.attempt:>8}  {record.resumed_from:>12}  "
+            f"{' ' * len(surface.name)}  {record.attempt:>8}  {record.resumed_from:>12}  "
             f"{record.server_progress_at_failure!s:>10}  "
             f"{record.reported_checkpoint!s:>8}"
         )
     log("")
 
     ok = True
-    for previous, current in itertools.pairwise(ATTEMPTS):
+    for previous, current in itertools.pairwise(surface.attempts):
         if previous.reported_checkpoint == previous.server_progress_at_failure:
             ok = False
             log(
-                f"attempt {previous.attempt} reported the same checkpoint the server already "
-                f"had ({previous.reported_checkpoint}): nothing is demonstrated"
+                f"{surface.name} attempt {previous.attempt} reported the same checkpoint the "
+                f"server already had ({previous.reported_checkpoint}): nothing is demonstrated"
             )
         if current.resumed_from != previous.reported_checkpoint:
             ok = False
             log(
-                f"attempt {current.attempt} resumed from {current.resumed_from}, expected "
-                f"{previous.reported_checkpoint} reported by attempt {previous.attempt}'s failure"
+                f"{surface.name} attempt {current.attempt} resumed from {current.resumed_from}, "
+                f"expected {previous.reported_checkpoint} reported by attempt "
+                f"{previous.attempt}'s failure"
             )
         else:
             log(
-                f"attempt {current.attempt} resumed from {current.resumed_from}: the payload "
-                f"attempt {previous.attempt}'s failure reported, not the {previous.server_progress_at_failure} "
-                f"it had heartbeated"
+                f"{surface.name} attempt {current.attempt} resumed from {current.resumed_from}: "
+                f"the payload attempt {previous.attempt}'s failure reported, not the "
+                f"{previous.server_progress_at_failure} it had heartbeated"
             )
     return ok
+
+
+async def run_workflow_activity(client: Client) -> None:
+    handle = await client.start_workflow(
+        HeartbeatWorkload.run,
+        id=f"heartbeat-workload-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+    )
+    log(f"started workflow {handle.id}")
+    log(f"workflow result: {await handle.result()}")
+
+
+async def run_standalone_activity(client: Client) -> None:
+    handle = await client.start_activity(
+        process_chunks,
+        id=f"heartbeat-workload-activity-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=RETRY_POLICY,
+    )
+    log(f"started activity {handle.id}")
+    log(f"activity result: {await handle.result()}")
 
 
 async def main() -> None:
@@ -211,19 +277,17 @@ async def main() -> None:
         workflows=[HeartbeatWorkload],
         activities=[process_chunks],
         workflow_runner=UnsandboxedWorkflowRunner(),
+        # Keep heartbeats flowing to the server promptly: the default throttle is
+        # 0.8 * heartbeat_timeout, which each attempt would have to wait out before failing.
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
     )
     async with worker:
-        handle = await client.start_workflow(
-            HeartbeatWorkload.run,
-            id=f"heartbeat-workload-{uuid.uuid4().hex[:8]}",
-            task_queue=TASK_QUEUE,
-        )
-        log(f"started workflow {handle.id}")
-        log(f"workflow result: {await handle.result()}")
+        await run_workflow_activity(client)
+        await run_standalone_activity(client)
 
-    if not report():
+    if not all([report(WFA), report(SAA)]):
         sys.exit("heartbeat resumption did not behave as described")
-    log("heartbeat resumption behaved as described")
+    log("heartbeat resumption behaved as described on both surfaces")
 
 
 if __name__ == "__main__":
