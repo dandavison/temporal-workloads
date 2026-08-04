@@ -1,0 +1,126 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["temporalio"]
+# ///
+"""
+Generate Standalone Activity traffic against a Temporal Cloud (test) namespace, to validate
+namespace_open_activities_count. Runs a worker and a client in the same process.
+
+
+Usage:
+  ./saa_traffic.py [num_activities] [sleep_seconds] [run_seconds]
+"""
+
+import asyncio
+import os
+import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+from google.protobuf.duration_pb2 import Duration
+from temporalio import activity
+from temporalio.api.common.v1 import ActivityType, Callback, Link, Payloads
+from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.workflowservice.v1 import StartActivityExecutionRequest
+from temporalio.client import Client
+from temporalio.service import RPCError
+from temporalio.worker import Worker
+
+TASK_QUEUE = "saa-metrics-test-task-queue"
+
+
+@activity.defn
+def slow_activity(sleep_seconds: int) -> str:
+    activity.logger.info(f"sleeping for {sleep_seconds}s")
+    import time
+
+    time.sleep(sleep_seconds)
+    return "done"
+
+
+async def main() -> None:
+    num_activities = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    sleep_seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 120
+    run_seconds = int(sys.argv[3]) if len(sys.argv) > 3 else 240
+
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+    api_key = os.environ.get("TEMPORAL_API_KEY")
+
+    client = await Client.connect(
+        address,
+        namespace=namespace,
+        api_key=api_key,
+        tls=bool(api_key),
+    )
+
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        activities=[slow_activity],
+        activity_executor=ThreadPoolExecutor(num_activities),
+    )
+    callback_url = os.environ.get(
+        "TEMPORAL_CALLBACK_URL", "http://localhost/saa-callback"
+    )
+
+    # The worker must be run via its context manager: if its task is merely cancelled while
+    # pollers are established, shutdown never completes and the process hangs, swallowing
+    # whatever error caused us to bail out.
+    async with worker:
+        handles = []
+        for i in range(num_activities):
+            activity_id = f"saa-metrics-test-{i}"
+            request = StartActivityExecutionRequest(
+                namespace=namespace,
+                identity=client.identity,
+                request_id=str(uuid.uuid4()),
+                activity_id=activity_id,
+                activity_type=ActivityType(name=slow_activity.__name__),
+                task_queue=TaskQueue(name=TASK_QUEUE),
+                input=Payloads(
+                    payloads=await client.data_converter.encode([sleep_seconds])
+                ),
+                start_to_close_timeout=Duration(seconds=sleep_seconds + 30),
+                completion_callbacks=[Callback(nexus=Callback.Nexus(url=callback_url))],
+                links=[
+                    Link(
+                        activity=Link.Activity(
+                            namespace=namespace,
+                            activity_id=handles[-1].id,
+                            run_id=handles[-1].run_id,
+                        )
+                    )
+                ]
+                if handles
+                else [],
+            )
+            try:
+                resp = await client.workflow_service.start_activity_execution(request)
+            except RPCError as err:
+                sys.exit(f"StartActivityExecution({activity_id}) failed: {err.message}")
+            print(f"started {activity_id} run={resp.run_id}")
+            handles.append(client.get_activity_handle(activity_id, run_id=resp.run_id))
+
+        async def report_open_count() -> None:
+            while True:
+                count = await client.count_activities("ExecutionStatus='Running'")
+                print(f"[local check] open activities: {count.count}")
+                await asyncio.sleep(15)
+
+        report_task = asyncio.create_task(report_open_count())
+
+        await asyncio.sleep(run_seconds)
+
+        report_task.cancel()
+        for handle in handles:
+            try:
+                print(f"{handle.id}: {await handle.result()}")
+            except Exception as e:
+                print(f"{handle.id}: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

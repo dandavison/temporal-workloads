@@ -1,0 +1,257 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["temporalio"]
+# ///
+"""
+Set up long-running executions so you can manually exercise every batchable
+job against a local server, and print the CLI commands to run.
+
+The Standalone Activity (SAA) batch operations added in cli PR #1100
+(https://github.com/temporalio/cli/pull/1100) are the feature under test, but
+that server feature branch touched a lot of shared code, so this also stands up
+Workflows to confirm the full set of workflow batch operations still work.
+
+There are three families of batchable job, each targeting a different kind of
+execution via `--query`:
+
+  1. Workflow batch ops (query WorkflowType):
+     signal, reset, update-options, cancel, terminate, delete.
+  2. Workflow-Activity batch ops (query WorkflowType; `temporal activity ...`
+     operating on the Activities running inside those Workflows):
+     reset, update-options, unpause.
+  3. Standalone-Activity batch ops (query ActivityType; the PR #1100 feature):
+     cancel, terminate, delete.
+
+To cover (1) and (2) this starts Workflows that each run a long, heartbeating
+Activity and expose a signal handler. To cover (3) it starts standalone
+Activities. It runs the workers in-process and keeps them alive so the
+executions stay Running while you run CLI commands, then blocks until Ctrl-C.
+
+Usage:
+  ./temporal-workload-batch-python [num_each] [sleep_seconds]
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+  TEMPORAL_CLI        CLI binary for the printed commands
+                      (default /tmp/temporal-saa-batch, the branch build)
+"""
+
+import asyncio
+import os
+import sys
+import uuid
+from datetime import timedelta
+
+from google.protobuf.duration_pb2 import Duration
+from temporalio import activity, workflow
+from temporalio.api.common.v1 import ActivityType, Payloads
+from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.workflowservice.v1 import StartActivityExecutionRequest
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "BatchTestWorkflow"
+WORKFLOW_ACTIVITY_TYPE = "BatchTestWorkflowActivity"
+STANDALONE_ACTIVITY_TYPE = "BatchTestStandaloneActivity"
+WORKFLOW_TASK_QUEUE = "batch-test-workflow-tq"
+ACTIVITY_TASK_QUEUE = "batch-test-activity-tq"
+
+
+async def _sleep_heartbeat(sleep_seconds: int) -> str:
+    for _ in range(sleep_seconds):
+        activity.heartbeat()
+        await asyncio.sleep(1)
+    return "done"
+
+
+@activity.defn(name=STANDALONE_ACTIVITY_TYPE)
+async def standalone_activity(sleep_seconds: int) -> str:
+    return await _sleep_heartbeat(sleep_seconds)
+
+
+@activity.defn(name=WORKFLOW_ACTIVITY_TYPE)
+async def workflow_activity(sleep_seconds: int) -> str:
+    return await _sleep_heartbeat(sleep_seconds)
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class BatchTestWorkflow:
+    def __init__(self) -> None:
+        self._pokes = 0
+
+    @workflow.run
+    async def run(self, sleep_seconds: int) -> str:
+        await workflow.execute_activity(
+            WORKFLOW_ACTIVITY_TYPE,
+            sleep_seconds,
+            start_to_close_timeout=timedelta(seconds=sleep_seconds + 300),
+            heartbeat_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        return "done"
+
+    @workflow.signal
+    def poke(self, note: str = "") -> None:
+        self._pokes += 1
+
+
+async def main() -> None:
+    num_each = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    sleep_seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 600
+
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+    api_key = os.environ.get("TEMPORAL_API_KEY")
+    cli = os.environ.get("TEMPORAL_CLI", "/tmp/temporal-saa-batch")
+    run = uuid.uuid4().hex[:8]
+
+    client = await Client.connect(
+        address, namespace=namespace, api_key=api_key, tls=bool(api_key)
+    )
+
+    workflow_worker = Worker(
+        client,
+        task_queue=WORKFLOW_TASK_QUEUE,
+        workflows=[BatchTestWorkflow],
+        activities=[workflow_activity],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    )
+    activity_worker = Worker(
+        client,
+        task_queue=ACTIVITY_TASK_QUEUE,
+        activities=[standalone_activity],
+    )
+    workers = asyncio.gather(workflow_worker.run(), activity_worker.run())
+
+    workflow_ids = []
+    for i in range(num_each):
+        workflow_id = f"batch-test-workflow-{run}-{i}"
+        handle = await client.start_workflow(
+            BatchTestWorkflow.run,
+            sleep_seconds,
+            id=workflow_id,
+            task_queue=WORKFLOW_TASK_QUEUE,
+        )
+        workflow_ids.append(workflow_id)
+        print(f"started workflow {workflow_id} run={handle.result_run_id}")
+
+    activity_ids = []
+    for i in range(num_each):
+        activity_id = f"batch-test-activity-{run}-{i}"
+        resp = await client.workflow_service.start_activity_execution(
+            StartActivityExecutionRequest(
+                namespace=namespace,
+                identity=client.identity,
+                request_id=str(uuid.uuid4()),
+                activity_id=activity_id,
+                activity_type=ActivityType(name=STANDALONE_ACTIVITY_TYPE),
+                task_queue=TaskQueue(name=ACTIVITY_TASK_QUEUE),
+                input=Payloads(
+                    payloads=await client.data_converter.encode([sleep_seconds])
+                ),
+                start_to_close_timeout=Duration(seconds=sleep_seconds + 60),
+            )
+        )
+        activity_ids.append(activity_id)
+        print(f"started activity {activity_id} run={resp.run_id}")
+
+    print_commands(cli, activity_ids[0], workflow_ids[0])
+
+    print("\nWorkers running; executions stay alive until you Ctrl-C.")
+    try:
+        await workers
+    except asyncio.CancelledError:
+        pass
+
+
+def print_commands(cli: str, sample_activity_id: str, sample_workflow_id: str) -> None:
+    wf_q = f'WorkflowType="{WORKFLOW_TYPE}"'
+    saa_q = f'ActivityType="{STANDALONE_ACTIVITY_TYPE}"'
+    sections = [
+        (
+            "1. Workflow batch ops (query WorkflowType)",
+            [
+                ("list", f"{cli} workflow list --query '{wf_q}'"),
+                (
+                    "describe one",
+                    f"{cli} workflow describe --workflow-id {sample_workflow_id}",
+                ),
+                ("signal", f"{cli} workflow signal --query '{wf_q}' --name poke --yes"),
+                (
+                    "reset",
+                    f"{cli} workflow reset --query '{wf_q}' "
+                    "--type FirstWorkflowTask --reason 'manual test' --yes",
+                ),
+                (
+                    "update-options",
+                    f"{cli} workflow update-options --query '{wf_q}' "
+                    "--versioning-override-behavior auto_upgrade --yes",
+                ),
+                ("cancel [terminal]", f"{cli} workflow cancel --query '{wf_q}' --yes"),
+                (
+                    "terminate [terminal]",
+                    f"{cli} workflow terminate --query '{wf_q}' --reason 'manual test' --yes",
+                ),
+                ("delete [terminal]", f"{cli} workflow delete --query '{wf_q}' --yes"),
+            ],
+        ),
+        (
+            "2. Workflow-Activity batch ops (query WorkflowType; targets Activities in the Workflows)",
+            [
+                ("reset", f"{cli} activity reset --query '{wf_q}' --yes"),
+                (
+                    "update-options (batch supports only --restore-original-options)",
+                    f"{cli} activity update-options --query '{wf_q}' "
+                    "--restore-original-options --yes",
+                ),
+                (
+                    "unpause (needs paused Activities first; see note)",
+                    f"{cli} activity unpause --query 'TemporalPauseInfo IS NOT NULL' --yes",
+                ),
+            ],
+        ),
+        (
+            "3. Standalone-Activity batch ops (query ActivityType; the PR #1100 feature)",
+            [
+                ("list", f"{cli} activity list --query '{saa_q}'"),
+                (
+                    "describe one",
+                    f"{cli} activity describe --activity-id {sample_activity_id}",
+                ),
+                (
+                    "cancel",
+                    f"{cli} activity cancel --query '{saa_q}' --reason 'manual test' --yes",
+                ),
+                (
+                    "terminate [terminal]",
+                    f"{cli} activity terminate --query '{saa_q}' --reason 'manual test' --yes",
+                ),
+                ("delete [terminal]", f"{cli} activity delete --query '{saa_q}' --yes"),
+            ],
+        ),
+    ]
+    for title, commands in sections:
+        print(f"\n=== {title} ===")
+        for label, command in commands:
+            print(f"  # {label}\n  {command}\n")
+    print(
+        "Notes:\n"
+        "  - [terminal] ops end the executions; run non-terminal ops first, then\n"
+        "    Ctrl-C and re-run this script to reset state between destructive tests.\n"
+        "  - Drop --yes to see the confirmation prompt.\n"
+        "  - unpause matches only paused Activities. To create some, pause a few\n"
+        "    first (non-batch), e.g.:\n"
+        f"      {cli} activity pause --activity-id ActId --workflow-id {sample_workflow_id}"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# Requires bash >= 4 (associative arrays); macOS ships bash 3.2 at
+# /bin/bash, so this needs a newer bash first on PATH (e.g. from Homebrew).
+# Exercises the deploy-straddle path for workflow batch operations: starts
+# batch terminate/cancel/signal/delete jobs on a server built BEFORE the
+# spk/saa-batch-cmds branch (which renamed BATCH_OPERATION_TYPE_TERMINATE etc.
+# to *_WORKFLOW), kills that server, restarts on a server built FROM the
+# branch against the same persisted database, and verifies each job
+# completes correctly and reports the new *_WORKFLOW operation type even
+# though it was started under the old enum.
+#
+# This checks that a batcher workflow whose execution spans a rolling
+# upgrade keeps working, and specifically that batchOperationTypeFromString's
+# legacy-string fallback (workflow_handler.go) does its job.
+#
+# Prerequisites (one-time, build the two binaries this script drives):
+#
+#   # "old" binary: pristine CLI + server from before this branch existed
+#   cd ~/worktrees/cli/ks--saa-batch-cmds/cli
+#   git worktree add /tmp/cli-pre-branch $(git merge-base HEAD origin/main) --detach
+#   (cd /tmp/cli-pre-branch && go build -o /tmp/temporal-old ./cmd/temporal)
+#
+#   # "new" binary: this branch's CLI + server
+#   cd ~/worktrees/cli/ks--saa-batch-cmds/cli
+#   go build -o /tmp/temporal-saa-batch ./cmd/temporal
+#
+# Usage:
+#   OLD_TEMPORAL_BIN=/tmp/temporal-old NEW_TEMPORAL_BIN=/tmp/temporal-saa-batch \
+#     ./temporal-workload-workflow-batch-upgrade
+set -euo pipefail
+
+OLD_BIN="${OLD_TEMPORAL_BIN:-/tmp/temporal-old}"
+NEW_BIN="${NEW_TEMPORAL_BIN:-/tmp/temporal-saa-batch}"
+PORT="${PORT:-17345}"
+HTTP_PORT=$((PORT + 1))
+ADDRESS="localhost:$PORT"
+TASK_QUEUE="workflow-batch-upgrade-tq"
+WORKFLOWS_PER_CASE=3
+
+for bin in "$OLD_BIN" "$NEW_BIN"; do
+	if [[ ! -x "$bin" ]]; then
+		echo "missing or non-executable binary: $bin (see prerequisites in this script's header)" >&2
+		exit 1
+	fi
+done
+
+WORKDIR=$(mktemp -d)
+DB_FILE="$WORKDIR/temporal.db"
+SERVER_PID=""
+
+cleanup() {
+	if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+		kill "$SERVER_PID" 2>/dev/null || true
+		wait "$SERVER_PID" 2>/dev/null || true
+	fi
+	rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+wait_ready() {
+	local bin=$1
+	for _ in $(seq 1 50); do
+		if "$bin" --address "$ADDRESS" operator namespace list >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.2
+	done
+	echo "server at $ADDRESS (via $bin) did not become ready" >&2
+	return 1
+}
+
+start_server() {
+	local bin=$1 log=$2
+	# Default per-namespace concurrent-batch limit is 1; this script starts
+	# 4 batch jobs back to back, so raise it.
+	"$bin" server start-dev --headless --db-filename "$DB_FILE" \
+		--port "$PORT" --http-port "$HTTP_PORT" --log-level warn \
+		--dynamic-config-value 'frontend.MaxConcurrentBatchOperationPerNamespace=10' \
+		>"$log" 2>&1 &
+	SERVER_PID=$!
+	wait_ready "$bin"
+}
+
+stop_server() {
+	# SIGKILL, not a graceful SIGTERM: a graceful shutdown lets the embedded
+	# per-namespace worker keep draining batch activity tasks for a variable
+	# amount of time, which non-deterministically lets more (or less)
+	# processing complete on the old binary before the swap. An abrupt kill
+	# gives a consistent "whatever was durably persisted so far" starting
+	# point for the new binary to resume from, and is also the more
+	# realistic worst case for a rolling upgrade.
+	kill -9 "$SERVER_PID" 2>/dev/null || true
+	wait "$SERVER_PID" 2>/dev/null || true
+	SERVER_PID=""
+}
+
+start_workflow() {
+	local bin=$1 id=$2 type=$3
+	"$bin" --address "$ADDRESS" workflow start \
+		--workflow-id "$id" --type "$type" --task-queue "$TASK_QUEUE" \
+		--execution-timeout 10m >/dev/null
+}
+
+# start_batch_case starts WORKFLOWS_PER_CASE workflows of a case-unique type
+# with no worker running (so they stay Running), then submits the batch
+# operation via --query. Echoes "<jobID> <case-unique-type>" on success.
+start_batch_case() {
+	local kind=$1
+	local wf_type="WorkflowBatchUpgrade_${kind}_$(uuidgen | tr 'A-Z' 'a-z' | cut -c1-8)"
+
+	for i in $(seq 1 "$WORKFLOWS_PER_CASE"); do
+		start_workflow "$OLD_BIN" "${wf_type}-${i}" "$wf_type"
+	done
+
+	local query="WorkflowType='${wf_type}'"
+	local out
+	case "$kind" in
+	terminate)
+		out=$("$OLD_BIN" --address "$ADDRESS" workflow terminate --query "$query" --reason "workflow-batch-upgrade" --yes 2>&1)
+		;;
+	cancel)
+		out=$("$OLD_BIN" --address "$ADDRESS" workflow cancel --query "$query" --reason "workflow-batch-upgrade" --yes 2>&1)
+		;;
+	signal)
+		out=$("$OLD_BIN" --address "$ADDRESS" workflow signal --query "$query" --name "workflow-batch-upgrade-signal" --reason "workflow-batch-upgrade" --yes 2>&1)
+		;;
+	delete)
+		out=$("$OLD_BIN" --address "$ADDRESS" workflow delete --query "$query" --reason "workflow-batch-upgrade" --yes 2>&1)
+		;;
+	*)
+		echo "unknown kind $kind" >&2
+		return 1
+		;;
+	esac
+
+	local job_id
+	job_id=$(echo "$out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}') || {
+		echo "$out" >&2
+		echo "could not find job ID in output for $kind" >&2
+		return 1
+	}
+	echo "$job_id $wf_type"
+}
+
+wait_for_batch_done() {
+	local job_id=$1
+	for _ in $(seq 1 60); do
+		local desc state
+		desc=$("$NEW_BIN" --address "$ADDRESS" batch describe --job-id "$job_id" -o json 2>&1) || {
+			echo "$desc" >&2
+			return 1
+		}
+		state=$(echo "$desc" | python3 -c "import json,sys; print(json.load(sys.stdin)['state'])")
+		if [[ "$state" != "BATCH_OPERATION_STATE_RUNNING" ]]; then
+			echo "$desc"
+			return 0
+		fi
+		sleep 0.5
+	done
+	echo "job $job_id did not finish in time" >&2
+	return 1
+}
+
+expected_operation_type() {
+	case "$1" in
+	terminate) echo "BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW" ;;
+	cancel) echo "BATCH_OPERATION_TYPE_CANCEL_WORKFLOW" ;;
+	signal) echo "BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW" ;;
+	delete) echo "BATCH_OPERATION_TYPE_DELETE_WORKFLOW" ;;
+	esac
+}
+
+expected_workflow_status() {
+	case "$1" in
+	terminate) echo "WORKFLOW_EXECUTION_STATUS_TERMINATED" ;;
+	# RequestCancelWorkflowExecution only records a cancel request; a
+	# workflow only reaches CANCELED once its own code observes that
+	# request and completes accordingly, which needs a worker. There is
+	# none here, so it correctly stays Running (verified below via the
+	# WorkflowExecutionCancelRequested history event instead).
+	cancel) echo "WORKFLOW_EXECUTION_STATUS_RUNNING" ;;
+	signal) echo "WORKFLOW_EXECUTION_STATUS_RUNNING" ;; # signal doesn't end the workflow
+	delete) echo "" ;;                                  # delete: workflow should be gone (NotFound)
+	esac
+}
+
+# verify_case checks the completed batch job's reported type/counts and each
+# target workflow's resulting state (or absence, for delete).
+verify_case() {
+	local kind=$1 job_id=$2 wf_type=$3
+	local desc
+	desc=$(wait_for_batch_done "$job_id") || return 1
+
+	python3 - "$desc" "$(expected_operation_type "$kind")" "$WORKFLOWS_PER_CASE" "$kind" <<'PY' || return 1
+import json, sys
+desc, want_type, want_count, kind = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+d = json.loads(desc)
+if d.get("state") != "BATCH_OPERATION_STATE_COMPLETED":
+    print(f"job ended in state {d.get('state')}, want COMPLETED", file=sys.stderr)
+    sys.exit(1)
+if d.get("operationType") != want_type:
+    print(f"operationType = {d.get('operationType')}, want {want_type}", file=sys.stderr)
+    sys.exit(1)
+if int(d.get("completeOperationCount", 0)) != want_count or int(d.get("failureOperationCount", 0)) != 0:
+    msg = f"complete={d.get('completeOperationCount')} failure={d.get('failureOperationCount')}, want complete={want_count} failure=0"
+    if kind == "delete":
+        # Pre-existing batcher characteristic, not specific to this branch or
+        # to the upgrade: delete removes its targets from visibility, so if
+        # the activity attempt that did some of the deleting dies (crash,
+        # not just an upgrade) before recording a heartbeat, the next
+        # attempt re-queries the same visibility query, finds only the
+        # not-yet-deleted remainder, and reports just that remainder's count
+        # -- undercounting the job's cumulative total even though every
+        # target does end up deleted (verified below per-target).
+        print(f"WARN (known pre-existing accounting gap for delete): {msg}", file=sys.stderr)
+    else:
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+PY
+
+	local want_status
+	want_status=$(expected_workflow_status "$kind")
+	for i in $(seq 1 "$WORKFLOWS_PER_CASE"); do
+		local id="${wf_type}-${i}"
+		local out
+		out=$("$NEW_BIN" --address "$ADDRESS" workflow describe --workflow-id "$id" -o json 2>&1) || true
+		if [[ "$kind" == "delete" ]]; then
+			if echo "$out" | grep -qi 'not found'; then
+				continue
+			fi
+			echo "workflow $id still describable after delete: $out" >&2
+			return 1
+		fi
+		local got_status
+		got_status=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['workflowExecutionInfo']['status'])" 2>&1) || {
+			echo "describe $id failed: $out" >&2
+			return 1
+		}
+		if [[ "$got_status" != "$want_status" ]]; then
+			echo "workflow $id: status=$got_status, want $want_status" >&2
+			return 1
+		fi
+		if [[ "$kind" == "cancel" ]]; then
+			local hist
+			hist=$("$NEW_BIN" --address "$ADDRESS" workflow show --workflow-id "$id" -o json 2>&1) || {
+				echo "show $id failed: $hist" >&2
+				return 1
+			}
+			if ! echo "$hist" | grep -q 'EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED'; then
+				echo "workflow $id: no WorkflowExecutionCancelRequested event in history" >&2
+				return 1
+			fi
+		fi
+	done
+}
+
+echo "== starting old server (pre-branch) =="
+start_server "$OLD_BIN" "$WORKDIR/old-server.log"
+
+declare -A JOB_ID
+declare -A WF_TYPE
+KINDS=(terminate cancel signal delete)
+for kind in "${KINDS[@]}"; do
+	read -r job_id wf_type <<<"$(start_batch_case "$kind")"
+	JOB_ID[$kind]=$job_id
+	WF_TYPE[$kind]=$wf_type
+	echo "started $kind batch job $job_id (old server, old enum)"
+done
+
+echo "== stopping old server =="
+stop_server
+
+echo "== starting new server (this branch) against the same db =="
+start_server "$NEW_BIN" "$WORKDIR/new-server.log"
+
+failed=0
+for kind in "${KINDS[@]}"; do
+	label="$kind (started old, finished new)"
+	if verify_case "$kind" "${JOB_ID[$kind]}" "${WF_TYPE[$kind]}"; then
+		echo "PASS  $label"
+	else
+		echo "FAIL  $label"
+		failed=1
+	fi
+done
+
+exit "$failed"

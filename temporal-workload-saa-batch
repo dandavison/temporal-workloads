@@ -1,0 +1,5 @@
+#!/bin/bash
+# Manually exercises SAA batch operations (terminate/cancel/delete standalone
+# activities, via visibility query and via explicit ArchetypeExecutions).
+# See saa-batch-go/main.go for prerequisites and details.
+cd "$(dirname "$0")/saa-batch-go" && exec go run . "$@"

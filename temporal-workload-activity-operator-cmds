@@ -1,0 +1,1583 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio>=1.31"]
+# ///
+"""
+Exercise every targeting mode and flag of the `temporal activity`
+pause/unpause/reset/update-options commands, as reworked in cli PR
+"enable saa operator commands" (branch spk/activity-operator-cmds).
+
+What the PR changed, and therefore what this tests:
+
+  1. The four operator commands now route to the *ActivityExecution APIs
+     (PauseActivityExecution, UnpauseActivityExecution, ResetActivityExecution,
+     UpdateActivityExecutionOptions) for single-Activity operations.
+  2. A single operation may target a Standalone Activity: `--activity-id` alone
+     (latest run) or with `--run-id`. Previously `--workflow-id` was required.
+  3. `--workflow-id` (optionally with `--run-id`) still targets a workflow
+     Activity, and `--query` still starts a batch over matching Workflows.
+  4. `update-options` gained `--start-delay` (Standalone Activity, before first
+     dispatch) and fixed the update mask for `--task-queue`
+     ("task_queue_name" -> "task_queue.name").
+  5. `reset` lost `--reset-heartbeats`: reset now always clears heartbeats.
+
+Each test starts its own executions, drives the CLI as a subprocess, and
+verifies the resulting server state: DescribeActivityExecution for Standalone
+Activities, DescribeWorkflowExecution's pending activities for workflow
+Activities, and, where the observable is the Activity's own view (heartbeat
+details, which task queue an attempt arrived on), what the in-process worker
+saw. The raw gRPC responses are used rather than the SDK's typed wrappers,
+because a server new enough for these APIs reports Activity statuses that
+temporalio 1.31 cannot parse. Tests are independent; their executions are
+terminated afterwards.
+
+One test asserts documented behavior that the CLI did not deliver when this was
+written (cli spk/activity-operator-cmds, server 1.32.0-160.0); it is meant to
+fail until that is fixed:
+
+  - batch_update_options: update-options documents a batch example that changes
+    `--task-queue` over a `--query`, but the batch path is rejected with
+    "Either activity type must be set, or restore original should be set to
+    true". The CLI's batch request also carries no ActivityOptions at all, only
+    an update mask, so only `--restore-original-options` works in batch mode.
+
+wf_update_options_start_delay_rejected found a second gap, now fixed in the CLI:
+`--start-delay` for a workflow Activity used to exit 0 and echo the requested
+delay, while the stored options left start_delay unset and the retry schedule
+unchanged. The CLI now rejects the flag with --workflow-id or --query.
+
+Usage:
+  ./temporal-workload-activity-operator-cmds [--list] [--filter SUBSTRING] [-v]
+
+Build the CLI under test from the cli repo, and run its dev server with the
+dynamic config the Standalone Activity operator commands need:
+
+  go build -o /tmp/temporal-activity-ops ./cmd/temporal
+  /tmp/temporal-activity-ops server start-dev \
+      --dynamic-config-value activity.enableStandalone=true \
+      --dynamic-config-value activity.startDelayEnabled=true \
+      --dynamic-config-value history.enableStandaloneActivityOperatorCommands=true
+  TEMPORAL_CLI=/tmp/temporal-activity-ops ./temporal-workload-activity-operator-cmds
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for a local server)
+  TEMPORAL_CLI        CLI binary under test (default "temporal")
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import itertools
+import json
+import logging
+import os
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any, Protocol
+
+from temporalio import activity, workflow
+from temporalio.api.activity.v1 import ActivityExecutionInfo
+from temporalio.api.common.v1 import WorkflowExecution
+from temporalio.api.enums.v1 import ActivityExecutionStatus, PendingActivityState
+from temporalio.api.workflow.v1 import PendingActivityInfo
+from temporalio.api.workflowservice.v1 import (
+    DescribeActivityExecutionRequest,
+    DescribeWorkflowExecutionRequest,
+)
+from temporalio.client import ActivityHandle, Client, WorkflowHandle
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.runtime import LoggingConfig, Runtime, TelemetryConfig, TelemetryFilter
+from temporalio.service import RPCError
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+ACTIVITY_TYPE = "ActivityOperatorTestActivity"
+WORKFLOW_TYPE = "ActivityOperatorTestWorkflow"
+PRIMARY_TASK_QUEUE = "activity-operator-test-tq"
+ALTERNATE_TASK_QUEUE = "activity-operator-test-tq-alt"
+WORKFLOW_ACTIVITY_ID = "test-activity"
+IDENTITY = "activity-operator-workload"
+
+# Long enough that attempts are countable between polls, short enough that
+# waiting for a few attempts is quick.
+RETRY_INTERVAL = timedelta(seconds=2)
+START_TO_CLOSE = timedelta(seconds=10)
+ATTEMPTS_BEFORE_RESET = 3
+
+FAIL = "fail"
+HEARTBEAT_FAIL = "heartbeat-fail"
+SUCCEED = "succeed"
+
+RUN_TAG = uuid.uuid4().hex[:8]
+_ids = itertools.count()
+
+
+def unique(prefix: str) -> str:
+    return f"{prefix}-{RUN_TAG}-{next(_ids)}"
+
+
+# --------------------------------------------------------------------------- #
+# Worker
+# --------------------------------------------------------------------------- #
+
+# What the Activity itself saw, keyed by Workflow ID for a workflow Activity and
+# by Activity ID for a Standalone Activity: the task queue each attempt arrived
+# on, and how many heartbeat details each attempt inherited from the previous
+# one.
+DISPATCH_QUEUES: dict[str, list[str]] = defaultdict(list)
+INHERITED_HEARTBEATS: dict[str, list[int]] = defaultdict(list)
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def operator_test_activity(mode: str) -> str:
+    info = activity.info()
+    key = info.workflow_id or info.activity_id
+    DISPATCH_QUEUES[key].append(info.task_queue)
+    if mode == HEARTBEAT_FAIL:
+        INHERITED_HEARTBEATS[key].append(len(info.heartbeat_details))
+        activity.heartbeat("checkpoint")
+        await asyncio.sleep(0.2)
+        raise ApplicationError("failing on purpose, after heartbeating")
+    if mode == FAIL:
+        raise ApplicationError("failing on purpose")
+    return "done"
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class OperatorTestWorkflow:
+    @workflow.run
+    async def run(self, mode: str) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            mode,
+            activity_id=WORKFLOW_ACTIVITY_ID,
+            start_to_close_timeout=START_TO_CLOSE,
+            retry_policy=RetryPolicy(
+                initial_interval=RETRY_INTERVAL, maximum_interval=RETRY_INTERVAL
+            ),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Harness
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Config:
+    address: str
+    namespace: str
+    api_key: str | None
+    cli: str
+    verbose: bool
+
+    @staticmethod
+    def from_args(args: argparse.Namespace) -> Config:
+        return Config(
+            address=os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"),
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            cli=os.environ.get("TEMPORAL_CLI", "temporal"),
+            verbose=args.verbose,
+        )
+
+
+@dataclass
+class Ctx:
+    cfg: Config
+    client: Client
+    cleanups: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+
+
+@dataclass
+class CliResult:
+    cmdline: str
+    code: int
+    stdout: str
+    stderr: str
+
+    @property
+    def json(self) -> Any:
+        return json.loads(self.stdout) if self.stdout.strip() else None
+
+
+async def cli(ctx: Ctx, *args: str) -> CliResult:
+    cmd = [
+        ctx.cfg.cli,
+        *args,
+        "--address",
+        ctx.cfg.address,
+        "--namespace",
+        ctx.cfg.namespace,
+        "--output",
+        "json",
+    ]
+    if ctx.cfg.api_key:
+        cmd += ["--api-key", ctx.cfg.api_key, "--tls"]
+    cmdline = shlex.join(cmd)
+    if ctx.cfg.verbose:
+        print(f"        $ {cmdline}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    return CliResult(cmdline, proc.returncode or 0, out.decode(), err.decode())
+
+
+async def cli_ok(ctx: Ctx, *args: str) -> CliResult:
+    res = await cli(ctx, *args)
+    if res.code != 0:
+        raise AssertionError(
+            f"expected success from `{res.cmdline}`: "
+            f"exit={res.code} stderr={res.stderr.strip()!r}"
+        )
+    return res
+
+
+async def cli_fails(ctx: Ctx, *args: str, contains: str = "") -> CliResult:
+    res = await cli(ctx, *args)
+    if res.code == 0:
+        raise AssertionError(
+            f"expected failure from `{res.cmdline}` but it succeeded: "
+            f"{res.stdout.strip()!r}"
+        )
+    if contains and contains not in res.stderr:
+        raise AssertionError(
+            f"expected {contains!r} in stderr of `{res.cmdline}`, "
+            f"got {res.stderr.strip()!r}"
+        )
+    return res
+
+
+async def wait_until(
+    what: str, pred: Callable[[], Awaitable[bool]], timeout: float = 30.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if await pred():
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+        await asyncio.sleep(0.2)
+
+
+def assert_equal(actual: Any, expected: Any, what: str) -> None:
+    if actual != expected:
+        raise AssertionError(f"{what}: expected {expected!r}, got {actual!r}")
+
+
+def nanos(duration: timedelta) -> int:
+    """`update-options` prints Go time.Duration values, i.e. nanoseconds."""
+    return int(duration / timedelta(microseconds=1)) * 1000
+
+
+# --------------------------------------------------------------------------- #
+# Execution fixtures and server-state accessors
+# --------------------------------------------------------------------------- #
+
+
+async def start_standalone(
+    ctx: Ctx,
+    mode: str = FAIL,
+    *,
+    task_queue: str = PRIMARY_TASK_QUEUE,
+    start_delay: timedelta | None = None,
+    wait_for_attempt: int = 1,
+) -> ActivityHandle:
+    """Start a Standalone Activity. In the default FAIL mode it retries forever,
+    so it stays pending and can be paused, reset and updated."""
+    handle = await ctx.client.start_activity(
+        ACTIVITY_TYPE,
+        mode,
+        id=unique("saa"),
+        task_queue=task_queue,
+        start_to_close_timeout=START_TO_CLOSE,
+        retry_policy=RetryPolicy(
+            initial_interval=RETRY_INTERVAL, maximum_interval=RETRY_INTERVAL
+        ),
+        start_delay=start_delay,
+        result_type=str,
+    )
+    ctx.cleanups.append(lambda: terminate_activity(handle))
+    if wait_for_attempt:
+        await wait_until(
+            f"standalone activity {handle.id} to reach attempt {wait_for_attempt}",
+            lambda: saa_attempt_at_least(ctx, handle, wait_for_attempt),
+        )
+    return handle
+
+
+async def start_workflow_activity(
+    ctx: Ctx, mode: str = FAIL, *, wait_for_attempt: int = 1
+) -> WorkflowHandle[Any, str]:
+    """Start a Workflow whose single Activity retries forever."""
+    handle = await ctx.client.start_workflow(
+        WORKFLOW_TYPE,
+        mode,
+        id=unique("wf"),
+        task_queue=PRIMARY_TASK_QUEUE,
+        result_type=str,
+    )
+    ctx.cleanups.append(lambda: terminate_workflow(handle))
+    await wait_until(
+        f"workflow {handle.id} activity to reach attempt {wait_for_attempt}",
+        lambda: wf_attempt_at_least(ctx, handle, wait_for_attempt),
+    )
+    return handle
+
+
+async def terminate_activity(handle: ActivityHandle) -> None:
+    # Already closed (e.g. the Activity completed during its own test).
+    with contextlib.suppress(RPCError):
+        await handle.terminate(reason="workload cleanup")
+
+
+async def terminate_workflow(handle: WorkflowHandle[Any, Any]) -> None:
+    with contextlib.suppress(RPCError):
+        await handle.terminate(reason="workload cleanup")
+
+
+def run_id(handle: ActivityHandle) -> str:
+    """The Run ID of a started Activity, which is always set."""
+    assert handle.run_id is not None
+    return handle.run_id
+
+
+async def saa_info(ctx: Ctx, handle: ActivityHandle) -> ActivityExecutionInfo:
+    resp = await ctx.client.workflow_service.describe_activity_execution(
+        DescribeActivityExecutionRequest(
+            namespace=ctx.cfg.namespace, activity_id=handle.id, run_id=run_id(handle)
+        )
+    )
+    return resp.info
+
+
+async def wf_activity(
+    ctx: Ctx, handle: WorkflowHandle[Any, Any]
+) -> PendingActivityInfo:
+    resp = await ctx.client.workflow_service.describe_workflow_execution(
+        DescribeWorkflowExecutionRequest(
+            namespace=ctx.cfg.namespace,
+            execution=WorkflowExecution(workflow_id=handle.id),
+        )
+    )
+    for pending in resp.pending_activities:
+        if pending.activity_id == WORKFLOW_ACTIVITY_ID:
+            return pending
+    raise AssertionError(
+        f"workflow {handle.id} has no pending activity {WORKFLOW_ACTIVITY_ID}"
+    )
+
+
+async def wait_visible(ctx: Ctx, query: str, count: int) -> None:
+    async def indexed() -> bool:
+        found = 0
+        async for _ in ctx.client.list_workflows(query):
+            found += 1
+        return found >= count
+
+    await wait_until(
+        f"visibility to index {count} workflow(s) for {query}", indexed, 60
+    )
+
+
+def workflow_id_query(handles: list[WorkflowHandle[Any, str]]) -> str:
+    ors = " OR ".join(f'WorkflowId="{handle.id}"' for handle in handles)
+    return f"({ors}) AND ExecutionStatus='Running'"
+
+
+# --------------------------------------------------------------------------- #
+# Predicates, for wait_until and one-shot assertions
+# --------------------------------------------------------------------------- #
+
+
+async def not_(awaitable: Awaitable[bool]) -> bool:
+    return not await awaitable
+
+
+async def saa_attempt_at_least(ctx: Ctx, handle: ActivityHandle, attempt: int) -> bool:
+    return (await saa_info(ctx, handle)).attempt >= attempt
+
+
+async def saa_attempt_below(ctx: Ctx, handle: ActivityHandle, attempt: int) -> bool:
+    return (await saa_info(ctx, handle)).attempt < attempt
+
+
+async def saa_paused(ctx: Ctx, handle: ActivityHandle) -> bool:
+    return (await saa_info(ctx, handle)).run_state == (
+        PendingActivityState.PENDING_ACTIVITY_STATE_PAUSED
+    )
+
+
+async def saa_completed(ctx: Ctx, handle: ActivityHandle) -> bool:
+    return (await saa_info(ctx, handle)).status == (
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_COMPLETED
+    )
+
+
+async def saa_start_to_close_is(
+    ctx: Ctx, handle: ActivityHandle, expected: timedelta
+) -> bool:
+    return (
+        await saa_info(ctx, handle)
+    ).start_to_close_timeout.ToTimedelta() == expected
+
+
+async def wf_attempt_at_least(
+    ctx: Ctx, handle: WorkflowHandle[Any, Any], attempt: int
+) -> bool:
+    try:
+        return (await wf_activity(ctx, handle)).attempt >= attempt
+    except AssertionError:
+        return False
+
+
+async def wf_attempt_below(
+    ctx: Ctx, handle: WorkflowHandle[Any, Any], attempt: int
+) -> bool:
+    return (await wf_activity(ctx, handle)).attempt < attempt
+
+
+async def wf_paused(ctx: Ctx, handle: WorkflowHandle[Any, Any]) -> bool:
+    return (await wf_activity(ctx, handle)).paused
+
+
+async def wf_task_queue_is(
+    ctx: Ctx, handle: WorkflowHandle[Any, Any], expected: str
+) -> bool:
+    return (await wf_activity(ctx, handle)).activity_options.task_queue.name == expected
+
+
+async def wf_start_to_close_is(
+    ctx: Ctx, handle: WorkflowHandle[Any, Any], expected: timedelta
+) -> bool:
+    options = (await wf_activity(ctx, handle)).activity_options
+    return options.start_to_close_timeout.ToTimedelta() == expected
+
+
+async def dispatched_on(key: str, task_queue: str) -> bool:
+    return task_queue in DISPATCH_QUEUES[key]
+
+
+async def inherited_heartbeats(key: str, *, after: int) -> bool:
+    """An attempt started after `after` earlier attempts saw heartbeat details."""
+    return any(count > 0 for count in INHERITED_HEARTBEATS[key][after:])
+
+
+async def lost_heartbeats(key: str, *, after: int) -> bool:
+    """An attempt started after `after` earlier attempts saw no heartbeat
+    details, i.e. they were cleared."""
+    return any(count == 0 for count in INHERITED_HEARTBEATS[key][after:])
+
+
+# --------------------------------------------------------------------------- #
+# Test registry
+# --------------------------------------------------------------------------- #
+
+
+class TestFn(Protocol):
+    __name__: str
+
+    def __call__(self, ctx: Ctx) -> Awaitable[None]: ...
+
+
+@dataclass
+class Test:
+    group: str
+    name: str
+    fn: TestFn
+
+
+TESTS: list[Test] = []
+
+
+def test(group: str) -> Callable[[TestFn], TestFn]:
+    def register(fn: TestFn) -> TestFn:
+        TESTS.append(Test(group=group, name=fn.__name__.removeprefix("test_"), fn=fn))
+        return fn
+
+    return register
+
+
+# --------------------------------------------------------------------------- #
+# Standalone Activity: pause / unpause
+# --------------------------------------------------------------------------- #
+
+SAA_PAUSE = "standalone activity: pause/unpause"
+
+
+@test(SAA_PAUSE)
+async def test_pause_unpause_latest_run(ctx: Ctx) -> None:
+    """--activity-id alone targets the latest run."""
+    handle = await start_standalone(ctx)
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "pause",
+        "--activity-id",
+        handle.id,
+        "--identity",
+        IDENTITY,
+        "--reason",
+        "workload test",
+    )
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+
+    await cli_ok(ctx, "activity", "unpause", "--activity-id", handle.id)
+    await wait_until("activity to be unpaused", lambda: not_(saa_paused(ctx, handle)))
+
+
+@test(SAA_PAUSE)
+async def test_pause_unpause_explicit_run_id(ctx: Ctx) -> None:
+    """--activity-id with --run-id targets that specific run."""
+    handle = await start_standalone(ctx)
+
+    await cli_ok(
+        ctx, "activity", "pause", "--activity-id", handle.id, "--run-id", run_id(handle)
+    )
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "unpause",
+        "--activity-id",
+        handle.id,
+        "--run-id",
+        run_id(handle),
+    )
+    await wait_until("activity to be unpaused", lambda: not_(saa_paused(ctx, handle)))
+
+
+@test(SAA_PAUSE)
+async def test_pause_unknown_run_id_fails(ctx: Ctx) -> None:
+    """A --run-id that does not exist is an error, not a silent fallback to the
+    latest run."""
+    handle = await start_standalone(ctx)
+    await cli_fails(
+        ctx,
+        "activity",
+        "pause",
+        "--activity-id",
+        handle.id,
+        "--run-id",
+        str(uuid.uuid4()),
+    )
+    assert_equal(
+        await saa_paused(ctx, handle), False, "activity should still be running"
+    )
+
+
+@test(SAA_PAUSE)
+async def test_unpause_reset_attempts(ctx: Ctx) -> None:
+    """--reset-attempts zeroes the attempt count as the Activity resumes."""
+    handle = await start_standalone(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+
+    await cli_ok(
+        ctx, "activity", "unpause", "--activity-id", handle.id, "--reset-attempts"
+    )
+    await wait_until(
+        "attempt count to drop",
+        lambda: saa_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+    )
+
+
+@test(SAA_PAUSE)
+async def test_unpause_reset_heartbeats(ctx: Ctx) -> None:
+    """--reset-heartbeats clears the heartbeat details the next attempt would
+    otherwise inherit."""
+    handle = await start_standalone(ctx, HEARTBEAT_FAIL)
+    await wait_until(
+        "an attempt to inherit heartbeat details",
+        lambda: inherited_heartbeats(handle.id, after=0),
+    )
+    attempts_so_far = len(INHERITED_HEARTBEATS[handle.id])
+
+    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+    await cli_ok(
+        ctx, "activity", "unpause", "--activity-id", handle.id, "--reset-heartbeats"
+    )
+    await wait_until(
+        "the next attempt to inherit no heartbeat details",
+        lambda: lost_heartbeats(handle.id, after=attempts_so_far),
+    )
+
+
+@test(SAA_PAUSE)
+async def test_unpause_keeps_heartbeats_by_default(ctx: Ctx) -> None:
+    """Without --reset-heartbeats, heartbeat details survive the pause."""
+    handle = await start_standalone(ctx, HEARTBEAT_FAIL)
+    await wait_until(
+        "an attempt to inherit heartbeat details",
+        lambda: inherited_heartbeats(handle.id, after=0),
+    )
+    attempts_so_far = len(INHERITED_HEARTBEATS[handle.id])
+
+    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+    await cli_ok(ctx, "activity", "unpause", "--activity-id", handle.id)
+    await wait_until(
+        "a later attempt to still inherit heartbeat details",
+        lambda: inherited_heartbeats(handle.id, after=attempts_so_far),
+    )
+    assert_equal(
+        await lost_heartbeats(handle.id, after=attempts_so_far),
+        False,
+        "no attempt should have lost its heartbeat details",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Standalone Activity: reset
+# --------------------------------------------------------------------------- #
+
+SAA_RESET = "standalone activity: reset"
+
+
+@test(SAA_RESET)
+async def test_reset_latest_run(ctx: Ctx) -> None:
+    handle = await start_standalone(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    res = await cli_ok(ctx, "activity", "reset", "--activity-id", handle.id)
+    assert_equal(res.json["keepPaused"], False, "reset output keepPaused")
+    await wait_until(
+        "attempt count to drop",
+        lambda: saa_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+    )
+
+
+@test(SAA_RESET)
+async def test_reset_explicit_run_id(ctx: Ctx) -> None:
+    handle = await start_standalone(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    await cli_ok(
+        ctx, "activity", "reset", "--activity-id", handle.id, "--run-id", run_id(handle)
+    )
+    await wait_until(
+        "attempt count to drop",
+        lambda: saa_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+    )
+
+
+@test(SAA_RESET)
+async def test_reset_unpauses_by_default(ctx: Ctx) -> None:
+    handle = await start_standalone(ctx)
+    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+
+    await cli_ok(ctx, "activity", "reset", "--activity-id", handle.id)
+    await wait_until("activity to be unpaused", lambda: not_(saa_paused(ctx, handle)))
+
+
+@test(SAA_RESET)
+async def test_reset_keep_paused(ctx: Ctx) -> None:
+    """--keep-paused resets attempts but leaves the Activity paused."""
+    handle = await start_standalone(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+
+    res = await cli_ok(
+        ctx, "activity", "reset", "--activity-id", handle.id, "--keep-paused"
+    )
+    assert_equal(res.json["keepPaused"], True, "reset output keepPaused")
+    await wait_until(
+        "attempt count to drop",
+        lambda: saa_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+    )
+    assert_equal(await saa_paused(ctx, handle), True, "activity should still be paused")
+
+
+@test(SAA_RESET)
+async def test_reset_clears_heartbeats(ctx: Ctx) -> None:
+    """This PR removed --reset-heartbeats because reset always clears
+    heartbeats."""
+    handle = await start_standalone(ctx, HEARTBEAT_FAIL)
+    await wait_until(
+        "an attempt to inherit heartbeat details",
+        lambda: inherited_heartbeats(handle.id, after=0),
+    )
+    attempts_so_far = len(INHERITED_HEARTBEATS[handle.id])
+
+    await cli_ok(ctx, "activity", "reset", "--activity-id", handle.id)
+    await wait_until(
+        "the next attempt to inherit no heartbeat details",
+        lambda: lost_heartbeats(handle.id, after=attempts_so_far),
+    )
+
+
+@test(SAA_RESET)
+async def test_reset_restore_original_options(ctx: Ctx) -> None:
+    handle = await start_standalone(ctx)
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--start-to-close-timeout",
+        "42s",
+    )
+    await wait_until(
+        "the updated start-to-close timeout to be visible",
+        lambda: saa_start_to_close_is(ctx, handle, timedelta(seconds=42)),
+    )
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "reset",
+        "--activity-id",
+        handle.id,
+        "--restore-original-options",
+    )
+    await wait_until(
+        "the original start-to-close timeout to be restored",
+        lambda: saa_start_to_close_is(ctx, handle, START_TO_CLOSE),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Standalone Activity: update-options
+# --------------------------------------------------------------------------- #
+
+SAA_UPDATE = "standalone activity: update-options"
+
+
+@test(SAA_UPDATE)
+async def test_update_options_all_flags(ctx: Ctx) -> None:
+    handle = await start_standalone(ctx)
+    res = await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--run-id",
+        run_id(handle),
+        "--identity",
+        IDENTITY,
+        "--schedule-to-close-timeout",
+        "120s",
+        "--schedule-to-start-timeout",
+        "30s",
+        "--start-to-close-timeout",
+        "20s",
+        "--heartbeat-timeout",
+        "15s",
+        "--retry-initial-interval",
+        "3s",
+        "--retry-maximum-interval",
+        "9s",
+        "--retry-backoff-coefficient",
+        "1.5",
+        "--retry-maximum-attempts",
+        "7",
+    )
+    # The command echoes what the server applied.
+    echoed = res.json
+    assert_equal(
+        echoed["ScheduleToCloseTimeout"],
+        nanos(timedelta(seconds=120)),
+        "echoed schedule-to-close timeout",
+    )
+    assert_equal(
+        echoed["StartToCloseTimeout"],
+        nanos(timedelta(seconds=20)),
+        "echoed start-to-close timeout",
+    )
+    assert_equal(echoed["BackoffCoefficient"], 1.5, "echoed retry backoff coefficient")
+    assert_equal(echoed["MaximumAttempts"], 7, "echoed retry maximum attempts")
+
+    info = await saa_info(ctx, handle)
+    assert_equal(
+        info.schedule_to_close_timeout.ToTimedelta(),
+        timedelta(seconds=120),
+        "schedule-to-close timeout",
+    )
+    assert_equal(
+        info.schedule_to_start_timeout.ToTimedelta(),
+        timedelta(seconds=30),
+        "schedule-to-start timeout",
+    )
+    assert_equal(
+        info.start_to_close_timeout.ToTimedelta(),
+        timedelta(seconds=20),
+        "start-to-close timeout",
+    )
+    assert_equal(
+        info.heartbeat_timeout.ToTimedelta(),
+        timedelta(seconds=15),
+        "heartbeat timeout",
+    )
+    assert_equal(
+        info.retry_policy.initial_interval.ToTimedelta(),
+        timedelta(seconds=3),
+        "retry initial interval",
+    )
+    assert_equal(
+        info.retry_policy.maximum_interval.ToTimedelta(),
+        timedelta(seconds=9),
+        "retry maximum interval",
+    )
+    assert_equal(
+        info.retry_policy.backoff_coefficient, 1.5, "retry backoff coefficient"
+    )
+    assert_equal(info.retry_policy.maximum_attempts, 7, "retry maximum attempts")
+
+
+@test(SAA_UPDATE)
+async def test_update_options_incremental(ctx: Ctx) -> None:
+    """Only the options passed are changed; the rest are left alone."""
+    handle = await start_standalone(ctx)
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        # Must stay under start-to-close, which the server caps it to.
+        "--heartbeat-timeout",
+        "7s",
+    )
+    info = await saa_info(ctx, handle)
+    assert_equal(
+        info.heartbeat_timeout.ToTimedelta(), timedelta(seconds=7), "heartbeat timeout"
+    )
+    assert_equal(
+        info.start_to_close_timeout.ToTimedelta(),
+        START_TO_CLOSE,
+        "untouched start-to-close timeout",
+    )
+    assert_equal(
+        info.retry_policy.initial_interval.ToTimedelta(),
+        RETRY_INTERVAL,
+        "untouched retry initial interval",
+    )
+
+
+@test(SAA_UPDATE)
+async def test_update_options_task_queue_redirects_dispatch(ctx: Ctx) -> None:
+    """The update mask fix ("task_queue.name"): --task-queue must be applied, and
+    subsequent Activity Tasks must go to the new queue."""
+    handle = await start_standalone(ctx)
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--task-queue",
+        ALTERNATE_TASK_QUEUE,
+    )
+    info = await saa_info(ctx, handle)
+    assert_equal(info.task_queue, ALTERNATE_TASK_QUEUE, "task queue")
+
+    await cli_ok(ctx, "activity", "reset", "--activity-id", handle.id)
+    await wait_until(
+        f"an attempt to be dispatched on {ALTERNATE_TASK_QUEUE}",
+        lambda: dispatched_on(handle.id, ALTERNATE_TASK_QUEUE),
+    )
+
+
+@test(SAA_UPDATE)
+async def test_update_options_restore_original(ctx: Ctx) -> None:
+    handle = await start_standalone(ctx)
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--start-to-close-timeout",
+        "37s",
+    )
+    await wait_until(
+        "the updated start-to-close timeout to be visible",
+        lambda: saa_start_to_close_is(ctx, handle, timedelta(seconds=37)),
+    )
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--restore-original-options",
+    )
+    await wait_until(
+        "the original start-to-close timeout to be restored",
+        lambda: saa_start_to_close_is(ctx, handle, START_TO_CLOSE),
+    )
+
+
+@test(SAA_UPDATE)
+async def test_update_options_start_delay_before_dispatch(ctx: Ctx) -> None:
+    """--start-delay may be shortened before the first dispatch; 0s makes the
+    Activity Task available immediately."""
+    handle = await start_standalone(
+        ctx, SUCCEED, start_delay=timedelta(minutes=5), wait_for_attempt=0
+    )
+    info = await saa_info(ctx, handle)
+    assert_equal(info.start_delay.ToTimedelta(), timedelta(minutes=5), "start delay")
+    assert_equal(
+        DISPATCH_QUEUES[handle.id],
+        [],
+        "activity should not be dispatched while delayed",
+    )
+
+    res = await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--start-delay",
+        "0s",
+    )
+    assert_equal(res.json["StartDelay"], 0, "echoed start delay")
+    await wait_until("activity to complete", lambda: saa_completed(ctx, handle))
+
+
+@test(SAA_UPDATE)
+async def test_update_options_start_delay_while_paused(ctx: Ctx) -> None:
+    """Same, with the Activity paused across the update: the shortened delay
+    takes effect once it is unpaused."""
+    handle = await start_standalone(
+        ctx, SUCCEED, start_delay=timedelta(minutes=5), wait_for_attempt=0
+    )
+    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
+    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--start-delay",
+        "0s",
+    )
+    assert_equal(
+        DISPATCH_QUEUES[handle.id], [], "paused activity should not be dispatched"
+    )
+
+    await cli_ok(ctx, "activity", "unpause", "--activity-id", handle.id)
+    await wait_until("activity to complete", lambda: saa_completed(ctx, handle))
+
+
+@test(SAA_UPDATE)
+async def test_update_options_start_delay_after_dispatch_rejected(ctx: Ctx) -> None:
+    """--start-delay cannot be changed once the first Activity Task has been
+    dispatched."""
+    handle = await start_standalone(ctx)
+    await cli_fails(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        handle.id,
+        "--start-delay",
+        "60s",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Workflow Activity: the pre-existing targeting mode, now on the new APIs
+# --------------------------------------------------------------------------- #
+
+WF_ACTIVITY = "workflow activity: single operations"
+
+
+@test(WF_ACTIVITY)
+async def test_wf_pause_unpause_latest_run(ctx: Ctx) -> None:
+    """--activity-id with --workflow-id and no --run-id: the workflow's latest
+    run."""
+    handle = await start_workflow_activity(ctx)
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "pause",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--reason",
+        "workload test",
+    )
+    await wait_until("workflow activity to be paused", lambda: wf_paused(ctx, handle))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "unpause",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+    )
+    await wait_until(
+        "workflow activity to be unpaused", lambda: not_(wf_paused(ctx, handle))
+    )
+
+
+@test(WF_ACTIVITY)
+async def test_wf_pause_unpause_explicit_run_id(ctx: Ctx) -> None:
+    handle = await start_workflow_activity(ctx)
+    run_id = handle.first_execution_run_id
+    assert run_id is not None
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "pause",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--run-id",
+        run_id,
+    )
+    await wait_until("workflow activity to be paused", lambda: wf_paused(ctx, handle))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "unpause",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--run-id",
+        run_id,
+        "--reset-attempts",
+    )
+    await wait_until(
+        "workflow activity to be unpaused", lambda: not_(wf_paused(ctx, handle))
+    )
+
+
+@test(WF_ACTIVITY)
+async def test_wf_reset(ctx: Ctx) -> None:
+    handle = await start_workflow_activity(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    res = await cli_ok(
+        ctx,
+        "activity",
+        "reset",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+    )
+    assert_equal(res.json["keepPaused"], False, "reset output keepPaused")
+    await wait_until(
+        "workflow activity attempt count to drop",
+        lambda: wf_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+    )
+
+
+@test(WF_ACTIVITY)
+async def test_wf_reset_keep_paused(ctx: Ctx) -> None:
+    handle = await start_workflow_activity(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    await cli_ok(
+        ctx,
+        "activity",
+        "pause",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+    )
+    await wait_until("workflow activity to be paused", lambda: wf_paused(ctx, handle))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "reset",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--keep-paused",
+    )
+    await wait_until(
+        "workflow activity attempt count to drop",
+        lambda: wf_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+    )
+    assert_equal(await wf_paused(ctx, handle), True, "activity should still be paused")
+
+
+@test(WF_ACTIVITY)
+async def test_wf_update_options_task_queue(ctx: Ctx) -> None:
+    """The update mask fix, for a workflow Activity."""
+    handle = await start_workflow_activity(ctx)
+    res = await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--task-queue",
+        ALTERNATE_TASK_QUEUE,
+        "--start-to-close-timeout",
+        "25s",
+    )
+    assert_equal(res.json["TaskQueue"], ALTERNATE_TASK_QUEUE, "echoed task queue")
+
+    pending = await wf_activity(ctx, handle)
+    assert_equal(
+        pending.activity_options.task_queue.name, ALTERNATE_TASK_QUEUE, "task queue"
+    )
+    assert_equal(
+        pending.activity_options.start_to_close_timeout.ToTimedelta(),
+        timedelta(seconds=25),
+        "start-to-close timeout",
+    )
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "reset",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+    )
+    await wait_until(
+        f"an attempt to be dispatched on {ALTERNATE_TASK_QUEUE}",
+        lambda: dispatched_on(handle.id, ALTERNATE_TASK_QUEUE),
+    )
+
+
+@test(WF_ACTIVITY)
+async def test_wf_update_options_start_delay_rejected(ctx: Ctx) -> None:
+    """--start-delay is documented as unsupported for workflow Activities, so it
+    should be rejected. Accepting it is only defensible if it actually applies:
+    reporting success while the stored options ignore the delay is not."""
+    handle = await start_workflow_activity(ctx)
+    res = await cli(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--start-delay",
+        "30s",
+    )
+    if res.code != 0:
+        return
+    stored = (await wf_activity(ctx, handle)).activity_options
+    assert_equal(
+        stored.start_delay.ToTimedelta(),
+        timedelta(seconds=30),
+        f"start delay stored after update-options exited 0 and echoed "
+        f"{res.json['StartDelay']}ns",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Batch (--query) mode
+# --------------------------------------------------------------------------- #
+
+BATCH = "batch (--query)"
+
+
+@test(BATCH)
+async def test_batch_unpause(ctx: Ctx) -> None:
+    handles = [await start_workflow_activity(ctx) for _ in range(2)]
+    for handle in handles:
+        await cli_ok(
+            ctx,
+            "activity",
+            "pause",
+            "--activity-id",
+            WORKFLOW_ACTIVITY_ID,
+            "--workflow-id",
+            handle.id,
+        )
+        await wait_until(
+            "workflow activity to be paused", lambda h=handle: wf_paused(ctx, h)
+        )
+
+    query = workflow_id_query(handles)
+    await wait_visible(ctx, query, len(handles))
+    await cli_ok(
+        ctx,
+        "activity",
+        "unpause",
+        "--query",
+        query,
+        "--reset-attempts",
+        "--reset-heartbeats",
+        "--jitter",
+        "1s",
+        "--reason",
+        "workload batch test",
+        "--yes",
+    )
+    for handle in handles:
+        await wait_until(
+            f"batch unpause of {handle.id}",
+            lambda h=handle: not_(wf_paused(ctx, h)),
+            90,
+        )
+
+
+@test(BATCH)
+async def test_batch_reset(ctx: Ctx) -> None:
+    handles = [
+        await start_workflow_activity(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+        for _ in range(2)
+    ]
+    query = workflow_id_query(handles)
+    await wait_visible(ctx, query, len(handles))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "reset",
+        "--query",
+        query,
+        "--reset-attempts",
+        "--jitter",
+        "1s",
+        "--yes",
+    )
+    for handle in handles:
+        await wait_until(
+            f"batch reset of {handle.id}",
+            lambda h=handle: wf_attempt_below(ctx, h, ATTEMPTS_BEFORE_RESET),
+            90,
+        )
+
+
+@test(BATCH)
+async def test_batch_update_options(ctx: Ctx) -> None:
+    handles = [await start_workflow_activity(ctx) for _ in range(2)]
+    query = workflow_id_query(handles)
+    await wait_visible(ctx, query, len(handles))
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--query",
+        query,
+        "--task-queue",
+        ALTERNATE_TASK_QUEUE,
+        "--yes",
+    )
+    for handle in handles:
+        await wait_until(
+            f"batch update-options of {handle.id}",
+            lambda h=handle: wf_task_queue_is(ctx, h, ALTERNATE_TASK_QUEUE),
+            90,
+        )
+
+
+@test(BATCH)
+async def test_batch_update_options_restore_original(ctx: Ctx) -> None:
+    handle = await start_workflow_activity(ctx)
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--activity-id",
+        WORKFLOW_ACTIVITY_ID,
+        "--workflow-id",
+        handle.id,
+        "--start-to-close-timeout",
+        "44s",
+    )
+    query = workflow_id_query([handle])
+    await wait_visible(ctx, query, 1)
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "update-options",
+        "--query",
+        query,
+        "--restore-original-options",
+        "--yes",
+    )
+    await wait_until(
+        "batch restore of the original options",
+        lambda: wf_start_to_close_is(ctx, handle, START_TO_CLOSE),
+        90,
+    )
+
+
+@test(BATCH)
+async def test_batch_ignores_activity_id(ctx: Ctx) -> None:
+    """--activity-id with --query is accepted: the Activity ID is ignored and a
+    batch over the matching Workflows runs instead."""
+    handle = await start_workflow_activity(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
+    query = workflow_id_query([handle])
+    await wait_visible(ctx, query, 1)
+
+    await cli_ok(
+        ctx,
+        "activity",
+        "reset",
+        "--activity-id",
+        "no-such-activity-id",
+        "--query",
+        query,
+        "--yes",
+    )
+    await wait_until(
+        "batch reset to take effect despite the bogus activity ID",
+        lambda: wf_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
+        90,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Invalid targeting
+# --------------------------------------------------------------------------- #
+
+INVALID = "invalid targeting"
+
+# Every invalid row of the targeting matrix. A single operation needs
+# --activity-id, optionally with --workflow-id and/or --run-id; --query is
+# mutually exclusive with both --workflow-id and --run-id; pause has no --query
+# at all.
+QUERY = f'WorkflowType="{WORKFLOW_TYPE}"'
+INVALID_CASES: list[dict[str, str]] = [
+    {},
+    {"--run-id": "r-id"},
+    {"--run-id": "r-id", "--query": QUERY},
+    {"--workflow-id": "w-id"},
+    {"--workflow-id": "w-id", "--query": QUERY},
+    {"--workflow-id": "w-id", "--run-id": "r-id"},
+    {"--workflow-id": "w-id", "--run-id": "r-id", "--query": QUERY},
+    {"--activity-id": "a-id", "--run-id": "r-id", "--query": QUERY},
+    {"--activity-id": "a-id", "--workflow-id": "w-id", "--query": QUERY},
+    {
+        "--activity-id": "a-id",
+        "--workflow-id": "w-id",
+        "--run-id": "r-id",
+        "--query": QUERY,
+    },
+]
+
+
+@test(INVALID)
+async def test_invalid_targeting_matrix(ctx: Ctx) -> None:
+    accepted: list[str] = []
+    for command in ("pause", "unpause", "reset", "update-options"):
+        for case in INVALID_CASES:
+            args = ["activity", command]
+            for flag, value in case.items():
+                args += [flag, value]
+            if command != "pause":  # pause has no batch mode, hence no --yes
+                args.append("--yes")
+            res = await cli(ctx, *args)
+            if res.code == 0:
+                accepted.append(f"{command} {sorted(case)}")
+    if accepted:
+        raise AssertionError(f"invalid targeting accepted: {'; '.join(accepted)}")
+
+
+@test(INVALID)
+async def test_missing_target_error_names_the_flags(ctx: Ctx) -> None:
+    """The error tells the user how to retarget: --activity-id plus the optional
+    --workflow-id/--run-id, and --query for the batch-capable operations."""
+    for command in ("pause", "unpause", "reset", "update-options"):
+        res = await cli_fails(ctx, "activity", command)
+        for flag in ("--activity-id", "--workflow-id", "--run-id"):
+            if flag not in res.stderr:
+                raise AssertionError(
+                    f"{command} error should name {flag}: {res.stderr.strip()!r}"
+                )
+        mentions_query = "--query" in res.stderr
+        if command == "pause" and mentions_query:
+            raise AssertionError(
+                f"pause has no --query mode but its error mentions it: "
+                f"{res.stderr.strip()!r}"
+            )
+        if command != "pause" and not mentions_query:
+            raise AssertionError(
+                f"{command} error should name --query: {res.stderr.strip()!r}"
+            )
+
+
+@test(INVALID)
+async def test_reset_heartbeats_flag_removed(ctx: Ctx) -> None:
+    """This PR removed `reset --reset-heartbeats`; unpause keeps it."""
+    handle = await start_standalone(ctx)
+    await cli_fails(
+        ctx,
+        "activity",
+        "reset",
+        "--activity-id",
+        handle.id,
+        "--reset-heartbeats",
+        contains="unknown flag",
+    )
+
+
+@test(INVALID)
+async def test_pause_has_no_query_flag(ctx: Ctx) -> None:
+    await cli_fails(
+        ctx,
+        "activity",
+        "pause",
+        "--activity-id",
+        "a-id",
+        "--query",
+        QUERY,
+        contains="unknown flag",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Runner
+# --------------------------------------------------------------------------- #
+
+# (command, flag, present) triples proving the CLI under test is the branch
+# build rather than a released binary.
+CLI_SURFACE: list[tuple[str, str, bool]] = [
+    ("pause", "--workflow-id", True),
+    ("pause", "--run-id", True),
+    ("update-options", "--start-delay", True),
+    ("unpause", "--reset-heartbeats", True),
+    ("reset", "--reset-heartbeats", False),
+]
+
+
+def check_cli_surface(cfg: Config) -> None:
+    for command, flag, present in CLI_SURFACE:
+        help_text = subprocess.run(
+            [cfg.cli, "activity", command, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        ).stdout
+        if (flag in help_text) is not present:
+            verb = "lacks" if present else "still has"
+            sys.exit(
+                f"{cfg.cli} activity {command} {verb} {flag}, so it is not the "
+                "spk/activity-operator-cmds build. Build it in the cli repo with:\n"
+                "  go build -o /tmp/temporal-activity-ops ./cmd/temporal\n"
+                "and point TEMPORAL_CLI at it."
+            )
+
+
+async def run_tests(ctx: Ctx, tests: list[Test], timeout: float) -> list[str]:
+    failures: list[str] = []
+    group = ""
+    for t in tests:
+        if t.group != group:
+            group = t.group
+            print(f"\n=== {group} ===")
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(t.fn(ctx), timeout=timeout)
+            print(f"  PASS  {t.name} ({time.monotonic() - started:.1f}s)")
+        except Exception as err:  # noqa: BLE001 - any failure is a test failure
+            failures.append(f"{t.name}: {err}")
+            print(f"  FAIL  {t.name} ({time.monotonic() - started:.1f}s)")
+            print(f"        {err}")
+        finally:
+            for cleanup in reversed(ctx.cleanups):
+                await cleanup()
+            ctx.cleanups.clear()
+    return failures
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--list", action="store_true", help="list tests and exit")
+    parser.add_argument("--filter", default="", help="run tests matching a substring")
+    parser.add_argument(
+        "--test-timeout", type=float, default=180.0, help="per-test timeout in seconds"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="echo every CLI command"
+    )
+    args = parser.parse_args()
+
+    tests = [t for t in TESTS if args.filter in t.name or args.filter in t.group]
+    if args.list:
+        for t in tests:
+            print(f"{t.group}: {t.name}")
+        return 0
+    if not tests:
+        print(f"no tests match {args.filter!r}")
+        return 1
+
+    cfg = Config.from_args(args)
+    check_cli_surface(cfg)
+    print(f"CLI: {cfg.cli}")
+    print(f"Server: {cfg.address} namespace={cfg.namespace}")
+    print(f"Running {len(tests)} test(s), run tag {RUN_TAG}")
+
+    # The Activities under test fail on purpose, and cleanup terminates them
+    # mid-attempt; the resulting stack traces and core warnings would bury the
+    # results.
+    logging.disable(logging.CRITICAL)
+    runtime = Runtime(
+        telemetry=TelemetryConfig(
+            logging=LoggingConfig(
+                filter=TelemetryFilter(core_level="ERROR", other_level="ERROR")
+            )
+        )
+    )
+
+    client = await Client.connect(
+        cfg.address,
+        namespace=cfg.namespace,
+        api_key=cfg.api_key,
+        tls=bool(cfg.api_key),
+        identity=IDENTITY,
+        runtime=runtime,
+    )
+    primary = Worker(
+        client,
+        task_queue=PRIMARY_TASK_QUEUE,
+        workflows=[OperatorTestWorkflow],
+        activities=[operator_test_activity],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    )
+    alternate = Worker(
+        client,
+        task_queue=ALTERNATE_TASK_QUEUE,
+        activities=[operator_test_activity],
+    )
+
+    async with primary, alternate:
+        failures = await run_tests(Ctx(cfg, client), tests, args.test_timeout)
+
+    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
+    for failure in failures:
+        print(f"  FAIL  {failure}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        sys.exit(130)
