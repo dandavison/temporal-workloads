@@ -1546,14 +1546,17 @@ async def main() -> int:
         )
     )
 
-    client = await Client.connect(
-        cfg.address,
-        namespace=cfg.namespace,
-        api_key=cfg.api_key,
-        tls=bool(cfg.api_key),
-        identity=IDENTITY,
-        runtime=runtime,
-    )
+    try:
+        client = await Client.connect(
+            cfg.address,
+            namespace=cfg.namespace,
+            api_key=cfg.api_key,
+            tls=bool(cfg.api_key),
+            identity=IDENTITY,
+            runtime=runtime,
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {cfg.address}: {err}")
     primary = Worker(
         client,
         task_queue=PRIMARY_TASK_QUEUE,

@@ -49,12 +49,15 @@ async def main() -> None:
     namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
     api_key = os.environ.get("TEMPORAL_API_KEY")
 
-    client = await Client.connect(
-        address,
-        namespace=namespace,
-        api_key=api_key,
-        tls=bool(api_key),
-    )
+    try:
+        client = await Client.connect(
+            address,
+            namespace=namespace,
+            api_key=api_key,
+            tls=bool(api_key),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
 
     worker = Worker(
         client,

@@ -5,47 +5,19 @@
 # describe/list/count and the in-progress control plane (describe/list while
 # running, then stop). See batch-api-go/main.go for the coverage list.
 #
-# Self-contained: starts its own dev server with the low worker.batcherRPS the
-# in-progress checks need (the per-request MaxOperationsPerSecond is not honored
-# by the batcher), runs the driver, and tears the server down.
+# Does not start a server: run one yourself and point TEMPORAL_ADDRESS at it
+# (default localhost:7233). The driver fails if it cannot reach one.
 #
-# The temporal binary must be built from the branch's CLI (which embeds the
-# branch server); default /tmp/temporal-saa-batch, override with TEMPORAL_BIN:
+# The server must be built from the branch, and needs a low worker.batcherRPS
+# for the in-progress checks (the per-request MaxOperationsPerSecond is not
+# honored by the batcher):
+#
 #   cd ~/worktrees/cli/ks--saa-batch-cmds/cli && go build -o /tmp/temporal-saa-batch ./cmd/temporal
+#   /tmp/temporal-saa-batch server start-dev --headless \
+#     --dynamic-config-value 'worker.batcherRPS=5' \
+#     --dynamic-config-value 'frontend.MaxConcurrentBatchOperationPerNamespace=10'
 #
 # Usage: ./temporal-workload-batch-api
 set -euo pipefail
 
-BIN="${TEMPORAL_BIN:-/tmp/temporal-saa-batch}"
-PORT="${PORT:-17410}"
-HTTP_PORT=$((PORT + 1))
-
-if [[ ! -x "$BIN" ]]; then
-	echo "temporal binary not found at $BIN (build from the branch CLI, or set TEMPORAL_BIN)" >&2
-	exit 1
-fi
-
-DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG="$(mktemp)"
-
-"$BIN" server start-dev --headless --port "$PORT" --http-port "$HTTP_PORT" --log-level warn \
-	--dynamic-config-value 'worker.batcherRPS=5' \
-	--dynamic-config-value 'frontend.MaxConcurrentBatchOperationPerNamespace=10' >"$LOG" 2>&1 &
-PID=$!
-
-cleanup() {
-	kill "$PID" 2>/dev/null || true
-	wait "$PID" 2>/dev/null || true
-	rm -f "$LOG"
-}
-trap cleanup EXIT
-
-for _ in $(seq 1 50); do
-	if "$BIN" --address "localhost:$PORT" operator namespace list >/dev/null 2>&1; then
-		break
-	fi
-	sleep 0.2
-done
-
-cd "$DIR/batch-api-go"
-TEMPORAL_ADDRESS="localhost:$PORT" go run . "$@"
+cd "$(dirname "$0")/batch-api-go" && exec go run . "$@"

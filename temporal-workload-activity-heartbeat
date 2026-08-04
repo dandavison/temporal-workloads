@@ -265,12 +265,16 @@ async def run_standalone_activity(client: Client) -> None:
 
 
 async def main() -> None:
-    client = await Client.connect(
-        os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"),
-        namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
-        api_key=os.environ.get("TEMPORAL_API_KEY"),
-        tls=bool(os.environ.get("TEMPORAL_API_KEY")),
-    )
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
