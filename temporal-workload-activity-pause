@@ -1,0 +1,981 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Investigate pause and unpause of an Activity in each of the three windows an operator can catch it
+in, on both product surfaces backed by the Activity CHASM component -- a Workflow Activity (WFA)
+and a Standalone Activity (SAA). The window matters because a pause can only stop what the server
+controls: a scheduled attempt is the server's to withhold, but a running attempt belongs to a
+worker, which is told nothing until it heartbeats.
+
+The contract, from the PauseActivityExecution doc comment in
+temporal/api/workflowservice/v1/service.proto:
+
+  - If the activity is currently waiting for a retry or is running and subsequently fails,
+    it will not be rescheduled until it is unpaused.
+  - If the activity is already paused, calling this method will have no effect.
+  - If the activity is running and finishes successfully, the activity will be completed.
+  - If the activity is running and finishes with failure:
+    * if there is no retry left - the activity will be completed.
+    * if there are more retries left - the activity will be paused.
+  For long-running activities:
+  - activities in paused state will send a cancellation with "activity_paused" set to 'true' in
+    response to 'RecordActivityTaskHeartbeat'.
+
+The cases, one execution each:
+
+  start delay        pause before the first attempt is due. SAA only: WFA has no start delay.
+  running, ignored   pause a running attempt whose code swallows the resulting cancellation and
+                     returns a result anyway, so the Activity completes with a pause outstanding.
+  running, honoured  pause a running attempt that lets the cancellation out, which is what the
+                     SDK's cancellation-details API invites an operator-friendly Activity to do.
+                     Then unpause, and check the next attempt resumes from the checkpoint.
+  unpaused in time   pause a running attempt and unpause it before it next heartbeats, so it is
+                     never told; it should run on untouched.
+  retry backoff      pause between attempts, unpause partway through the backoff, and measure when
+                     the retry actually lands.
+  last attempt       pause a running attempt with maximum_attempts=1, so the failure the pause
+                     provokes has no retry left to be paused into.
+
+The Activity is paced by the driver: it works, heartbeats, finishes or fails only when told to,
+over an in-process queue. That puts the interesting moment -- the heartbeat that carries the pause
+back to the worker -- exactly where the driver wants it rather than wherever the SDK's heartbeat
+throttling happens to put it, and it lets the driver prove that an attempt which does not heartbeat
+is never told about the pause at all.
+
+Where both surfaces are driven through the same operation and the contract does not say which
+behaviour is right, the workload records what each did and fails only if they disagree: an operator
+pausing an Activity should not have to know whether a Workflow scheduled it.
+
+Usage:
+  ./temporal-workload-activity-pause
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import asyncio
+import logging
+import os
+import sys
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from temporalio import activity, workflow
+from temporalio.activity import ActivityCancellationDetails
+from temporalio.api.activity.v1 import ActivityExecutionOutcome
+from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import ActivityExecutionStatus, PendingActivityState
+from temporalio.api.failure.v1 import Failure
+from temporalio.api.workflowservice.v1 import (
+    DescribeActivityExecutionRequest,
+    PauseActivityExecutionRequest,
+    UnpauseActivityExecutionRequest,
+)
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.service import RPCError, RPCStatusCode
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "ActivityPauseWorkload"
+ACTIVITY_TYPE = "PacedJob"
+TASK_QUEUE = "activity-pause-workload-tq"
+
+START_TO_CLOSE_TIMEOUT = timedelta(minutes=5)
+# Long enough that an attempt can sit idle, heartbeating nothing, while the driver reads the
+# server's view of it.
+HEARTBEAT_TIMEOUT = timedelta(seconds=30)
+# Small, so that a heartbeat the driver asked for is not held back by the SDK's throttling. When
+# the worker learns of a pause is the subject here, so it must not be an artifact of the throttle.
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(milliseconds=100)
+WORK_CHUNK = timedelta(milliseconds=200)
+
+RETRY_INTERVAL = timedelta(seconds=1)
+# The retry interval of the backoff case: long enough to pause inside it and still have most of it
+# left, and long enough that "dispatched on unpause" and "waited the backoff out" cannot be
+# mistaken for each other.
+BACKOFF = timedelta(seconds=15)
+START_DELAY = timedelta(seconds=12)
+# How long the driver leaves an Activity paused in the two cases where the pause interrupts a wait
+# rather than an attempt.
+PAUSED_FOR = timedelta(seconds=4)
+# Under this, an attempt was dispatched because it was unpaused, not because a wait ran out.
+PROMPTLY = timedelta(seconds=3)
+
+PATIENCE = 60.0
+# How long "the attempt was never told" is given to prove itself.
+QUIET = 1.5
+
+WFA = "WFA"
+SAA = "SAA"
+
+HEARTBEAT = "heartbeat"
+WORK = "work"
+FINISH = "finish"
+FAIL = "fail"
+
+PAUSED = PendingActivityState.PENDING_ACTIVITY_STATE_PAUSED
+PAUSE_REQUESTED = PendingActivityState.PENDING_ACTIVITY_STATE_PAUSE_REQUESTED
+STARTED = PendingActivityState.PENDING_ACTIVITY_STATE_STARTED
+
+# A paused SAA is not closed: ActivityExecutionStatus has a non-terminal PAUSED of its own, which a
+# WFA has no equivalent of -- there, the pause shows only in the pending Activity's run state.
+CLOSED_STATUSES = frozenset(
+    {
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_COMPLETED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_FAILED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_CANCELED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_TERMINATED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_TIMED_OUT,
+    }
+)
+
+
+@dataclass
+class Attempt:
+    """One attempt of the Activity, as the Activity itself saw it."""
+
+    number: int
+    resumed_from: int
+    started_at: float = field(default_factory=time.monotonic)
+    checkpoint: int = 0
+    heartbeats: int = 0
+    work_chunks: int = 0
+    cancellation: ActivityCancellationDetails | None = None
+
+
+@dataclass
+class Case:
+    """One pause, in one window, with the Activity configured to make that window reachable."""
+
+    name: str
+    drive: "Callable[[Client, Run], Awaitable[None]]"
+    surfaces: tuple[str, ...] = (WFA, SAA)
+    maximum_attempts: int = 10
+    retry_interval: timedelta = RETRY_INTERVAL
+    start_delay: timedelta | None = None
+    # Whether the Activity swallows the cancellation a pause provokes and returns a result anyway.
+    ignore_cancellation: bool = False
+
+
+@dataclass
+class Run:
+    """One case on one surface: one execution, one pause."""
+
+    case: Case
+    surface: str
+    key: str
+    activity_id: str = ""
+    run_id: str = ""
+    workflow_id: str | None = None
+    started_at: float = field(default_factory=time.monotonic)
+    attempts: list[Attempt] = field(default_factory=list)
+    commands: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+    cancelled: asyncio.Event = field(default_factory=asyncio.Event)
+    checks: list[tuple[bool, str]] = field(default_factory=list)
+    # A categorical description of what this surface did, for the cases where the contract permits
+    # more than one behaviour and only a disagreement between the surfaces is a problem.
+    behaviour: str = ""
+
+    def check(self, ok: bool, message: str) -> None:
+        self.checks.append((ok, message))
+        log(self, f"{'PASS' if ok else 'FAIL'}  {message}")
+
+    def note(self, message: str) -> None:
+        log(self, f"NOTE  {message}")
+
+
+RUNS: dict[str, Run] = {}
+
+
+@dataclass
+class Params:
+    """Workflow input: which Run the Activity belongs to, and how to schedule it."""
+
+    key: str
+    maximum_attempts: int
+    retry_interval_seconds: float
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def paced_job(key: str) -> str:
+    """Work, heartbeat, finish or fail on the driver's command, and record what a pause does."""
+    run = RUNS[key]
+    info = activity.info()
+    attempt = Attempt(
+        number=info.attempt,
+        resumed_from=info.heartbeat_details[0] if info.heartbeat_details else 0,
+    )
+    attempt.checkpoint = attempt.resumed_from
+    run.attempts.append(attempt)
+    log(
+        run,
+        f"attempt {attempt.number} started, resuming from checkpoint {attempt.resumed_from}",
+    )
+
+    try:
+        while True:
+            command = await run.commands.get()
+            if command == FINISH:
+                return f"finished at checkpoint {attempt.checkpoint}"
+            if command == FAIL:
+                raise ApplicationError(
+                    f"induced failure at checkpoint {attempt.checkpoint}"
+                )
+            if command == WORK:
+                await asyncio.sleep(WORK_CHUNK.total_seconds())
+                attempt.work_chunks += 1
+                continue
+            attempt.checkpoint += 1
+            activity.heartbeat(attempt.checkpoint)
+            attempt.heartbeats += 1
+    except asyncio.CancelledError:
+        attempt.cancellation = activity.cancellation_details()
+        run.cancelled.set()
+        log(run, f"attempt {attempt.number} cancelled: {attempt.cancellation}")
+        if run.case.ignore_cancellation:
+            return f"ignored the cancellation and finished at checkpoint {attempt.checkpoint}"
+        raise
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class ActivityPauseWorkload:
+    @workflow.run
+    async def run(self, params: Params) -> str:
+        try:
+            return await workflow.execute_activity(
+                ACTIVITY_TYPE,
+                params.key,
+                start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+                heartbeat_timeout=HEARTBEAT_TIMEOUT,
+                retry_policy=RetryPolicy(
+                    maximum_attempts=params.maximum_attempts,
+                    initial_interval=timedelta(seconds=params.retry_interval_seconds),
+                    backoff_coefficient=1.0,
+                ),
+            )
+        except ActivityError as err:
+            return f"activity failed: {err.cause}"
+
+
+@dataclass
+class Observed:
+    """What the server reports about the Activity, from whichever Describe API serves the surface
+    it is running on."""
+
+    pending: bool
+    run_state: PendingActivityState.ValueType
+    attempt: int
+    checkpoint: int | None
+    next_attempt_due: datetime | None
+    last_failure_type: str
+    # Empty while the Activity is still pending; otherwise how it closed.
+    outcome: str
+
+    def __str__(self) -> str:
+        if not self.pending:
+            return f"closed, {self.outcome}"
+        due = (
+            f" nextAttemptDue={self.next_attempt_due.time()}"
+            if self.next_attempt_due
+            else ""
+        )
+        failure = (
+            f" lastFailure={self.last_failure_type}" if self.last_failure_type else ""
+        )
+        return (
+            f"{PendingActivityState.Name(self.run_state)} attempt={self.attempt} "
+            f"checkpoint={self.checkpoint}{due}{failure}"
+        )
+
+
+async def observe(client: Client, run: Run) -> Observed:
+    if run.workflow_id is not None:
+        return await observe_workflow_activity(client, run)
+    return await observe_standalone_activity(client, run)
+
+
+async def observe_workflow_activity(client: Client, run: Run) -> Observed:
+    assert run.workflow_id is not None
+    handle = client.get_workflow_handle(run.workflow_id, run_id=run.run_id)
+    pending = next(
+        iter((await handle.describe()).raw_description.pending_activities), None
+    )
+    if pending is None:
+        # The Activity has closed one way or another, and the Workflow says which: it returns the
+        # Activity's result, or a description of the failure it ended on.
+        return closed(
+            f"workflow returned {await asyncio.wait_for(handle.result(), PATIENCE)!r}"
+        )
+    run.activity_id = pending.activity_id
+    return Observed(
+        pending=True,
+        run_state=pending.state,
+        attempt=pending.attempt,
+        checkpoint=await decode_checkpoint(client, pending.heartbeat_details.payloads),
+        next_attempt_due=(
+            pending.next_attempt_schedule_time.ToDatetime()
+            if pending.HasField("next_attempt_schedule_time")
+            else None
+        ),
+        last_failure_type=failure_type(pending.last_failure),
+        outcome="",
+    )
+
+
+async def observe_standalone_activity(client: Client, run: Run) -> Observed:
+    response = await client.workflow_service.describe_activity_execution(
+        DescribeActivityExecutionRequest(
+            namespace=client.namespace,
+            activity_id=run.activity_id,
+            run_id=run.run_id,
+            include_heartbeat_details=True,
+            include_last_failure=True,
+            include_outcome=True,
+        )
+    )
+    info = response.info
+    if info.status in CLOSED_STATUSES:
+        status = ActivityExecutionStatus.Name(info.status)
+        return closed(
+            f"{status} with {await describe_outcome(client, response.outcome)}"
+        )
+    return Observed(
+        pending=True,
+        run_state=info.run_state,
+        attempt=info.attempt,
+        checkpoint=await decode_checkpoint(client, info.heartbeat_details.payloads),
+        next_attempt_due=(
+            info.next_attempt_schedule_time.ToDatetime()
+            if info.HasField("next_attempt_schedule_time")
+            else None
+        ),
+        last_failure_type=failure_type(info.last_failure),
+        outcome="",
+    )
+
+
+def closed(outcome: str) -> Observed:
+    return Observed(
+        pending=False,
+        run_state=PendingActivityState.PENDING_ACTIVITY_STATE_UNSPECIFIED,
+        attempt=0,
+        checkpoint=None,
+        next_attempt_due=None,
+        last_failure_type="",
+        outcome=outcome,
+    )
+
+
+async def describe_outcome(client: Client, outcome: ActivityExecutionOutcome) -> str:
+    if outcome.HasField("failure"):
+        return (
+            f"{failure_type(outcome.failure) or 'failure'} {outcome.failure.message!r}"
+        )
+    decoded = await client.data_converter.decode(outcome.result.payloads)
+    return f"result {decoded[0]!r}" if decoded else "no result"
+
+
+async def decode_checkpoint(client: Client, payloads: Sequence[Payload]) -> int | None:
+    decoded = await client.data_converter.decode(payloads) if payloads else []
+    return decoded[0] if decoded else None
+
+
+def failure_type(failure: Failure) -> str:
+    return failure.application_failure_info.type
+
+
+async def until(
+    client: Client, run: Run, what: str, condition: Callable[[Observed], bool]
+) -> Observed | None:
+    """Poll the server until condition holds, rather than hanging if it never does."""
+    deadline = time.monotonic() + PATIENCE
+    while True:
+        observed = await observe(client, run)
+        if condition(observed):
+            log(run, f"server reports {observed}")
+            return observed
+        if time.monotonic() > deadline:
+            run.check(False, f"timed out after {PATIENCE}s waiting for {what}")
+            return None
+        await asyncio.sleep(0.2)
+
+
+async def await_attempt(run: Run, number: int, patience: float = PATIENCE) -> bool:
+    deadline = time.monotonic() + patience
+    while len(run.attempts) < number:
+        if time.monotonic() > deadline:
+            run.check(False, f"attempt {number} never started within {patience}s")
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+async def await_checkpoint(client: Client, run: Run, least: int) -> Observed | None:
+    return await until(
+        client,
+        run,
+        f"the server to hold heartbeat checkpoint {least}",
+        lambda o: o.checkpoint is not None and o.checkpoint >= least,
+    )
+
+
+async def command(run: Run, what: str) -> None:
+    await run.commands.put(what)
+
+
+async def work(run: Run, chunks: int) -> int:
+    """Let the running attempt do some work without heartbeating; report how much it got through."""
+    attempt = run.attempts[-1]
+    before = attempt.work_chunks
+    for _ in range(chunks):
+        await command(run, WORK)
+    deadline = time.monotonic() + PATIENCE
+    while attempt.work_chunks < before + chunks and not run.cancelled.is_set():
+        if time.monotonic() > deadline:
+            break
+        await asyncio.sleep(0.05)
+    return attempt.work_chunks - before
+
+
+async def heartbeat_and_await_pause(run: Run) -> bool:
+    """Heartbeat once, and wait for the pause to come back on the response."""
+    await command(run, HEARTBEAT)
+    try:
+        await asyncio.wait_for(run.cancelled.wait(), PATIENCE)
+    except TimeoutError:
+        run.check(
+            False,
+            f"the heartbeat sent after the pause did not cancel the attempt within {PATIENCE}s",
+        )
+        return False
+    return True
+
+
+async def stayed_quiet(run: Run) -> bool:
+    try:
+        await asyncio.wait_for(run.cancelled.wait(), QUIET)
+    except TimeoutError:
+        return True
+    return False
+
+
+async def pause(client: Client, run: Run) -> None:
+    assert run.activity_id
+    await client.workflow_service.pause_activity_execution(
+        PauseActivityExecutionRequest(
+            namespace=client.namespace,
+            workflow_id=run.workflow_id or "",
+            activity_id=run.activity_id,
+            run_id=run.run_id,
+            identity=client.identity,
+            reason="activity-pause workload",
+            request_id=str(uuid.uuid4()),
+        )
+    )
+    log(run, "paused")
+
+
+async def unpause(client: Client, run: Run) -> None:
+    await client.workflow_service.unpause_activity_execution(
+        UnpauseActivityExecutionRequest(
+            namespace=client.namespace,
+            workflow_id=run.workflow_id or "",
+            activity_id=run.activity_id,
+            run_id=run.run_id,
+            identity=client.identity,
+            reason="activity-pause workload",
+        )
+    )
+    log(run, "unpaused")
+
+
+def check_cancellation_is_a_pause(run: Run) -> None:
+    cancellation = run.attempts[-1].cancellation
+    run.check(
+        cancellation == ActivityCancellationDetails(paused=True),
+        f"the attempt was cancelled with {cancellation}, want paused and nothing else",
+    )
+
+
+async def reach_heartbeating_attempt(client: Client, run: Run) -> bool:
+    """Get to an attempt that is running and has a checkpoint the server holds."""
+    if not await await_attempt(run, 1):
+        return False
+    await command(run, HEARTBEAT)
+    return await await_checkpoint(client, run, 1) is not None
+
+
+async def drive_start_delay(client: Client, run: Run) -> None:
+    """Pause before the first attempt is due, while the start delay is still running down."""
+    if (
+        await until(
+            client,
+            run,
+            "the Activity to report when its first attempt is due",
+            lambda o: o.next_attempt_due is not None,
+        )
+        is None
+    ):
+        return
+    await pause(client, run)
+    paused = await until(
+        client, run, "the Activity to be PAUSED", lambda o: o.run_state == PAUSED
+    )
+    if paused is None:
+        return
+    run.check(
+        not run.attempts, "no attempt started while paused inside the start delay"
+    )
+    run.check(
+        paused.next_attempt_due is None,
+        f"next_attempt_schedule_time is {paused.next_attempt_due}, want it cleared: while paused "
+        f"there is no time at which the first attempt will be dispatched",
+    )
+
+    await asyncio.sleep(PAUSED_FOR.total_seconds())
+    unpaused_at = time.monotonic()
+    await unpause(client, run)
+    if not await await_attempt(run, 1):
+        return
+    started = run.attempts[0].started_at - run.started_at
+    run.check(
+        started >= (START_DELAY - PROMPTLY).total_seconds(),
+        f"the first attempt started {started:.1f}s after the Activity was created, want no sooner "
+        f"than the {START_DELAY} start delay it was given",
+    )
+    run.note(
+        f"unpausing did not bring the first attempt forward: it started "
+        f"{run.attempts[0].started_at - unpaused_at:.1f}s after the unpause, at the end of the "
+        f"original start delay"
+    )
+    await command(run, FINISH)
+
+
+async def drive_running_ignored(client: Client, run: Run) -> None:
+    """Pause a running attempt that swallows the cancellation and returns a result anyway."""
+    if not await reach_heartbeating_attempt(client, run):
+        return
+    await pause(client, run)
+    if (
+        await until(
+            client,
+            run,
+            "the Activity to be PAUSE_REQUESTED",
+            lambda o: o.run_state == PAUSE_REQUESTED,
+        )
+        is None
+    ):
+        return
+    chunks = await work(run, 3)
+    run.check(
+        chunks == 3 and not run.cancelled.is_set(),
+        f"the attempt worked on through the pause, getting through {chunks} of 3 chunks with no "
+        f"cancellation: a pause reaches a worker only on a heartbeat response",
+    )
+
+    if not await heartbeat_and_await_pause(run):
+        return
+    check_cancellation_is_a_pause(run)
+    closed_as = await until(
+        client, run, "the Activity to close", lambda o: not o.pending
+    )
+    if closed_as is None:
+        return
+    run.check(
+        "ignored the cancellation" in closed_as.outcome,
+        f"the Activity is {closed_as}, want the result the attempt returned: an attempt that "
+        f"ignores the pause and succeeds still completes the Activity",
+    )
+    run.note(
+        "an Activity is only as pausable as its code: nothing stops an attempt that swallows the "
+        "cancellation, and the pause is discarded along with the Activity"
+    )
+
+
+async def drive_running_honoured(client: Client, run: Run) -> None:
+    """Pause a running attempt that lets the cancellation out, then unpause it."""
+    if not await reach_heartbeating_attempt(client, run):
+        return
+    await pause(client, run)
+    if not await heartbeat_and_await_pause(run):
+        return
+    check_cancellation_is_a_pause(run)
+    interrupted = run.attempts[0]
+
+    paused = await until(
+        client,
+        run,
+        "the Activity to settle into PAUSED",
+        lambda o: o.run_state == PAUSED,
+    )
+    if paused is None:
+        return
+    run.check(
+        len(run.attempts) == 1,
+        f"{len(run.attempts)} attempts have run, want 1: no attempt starts while paused",
+    )
+    run.check(
+        paused.checkpoint == interrupted.checkpoint,
+        f"the server holds checkpoint {paused.checkpoint}, want the {interrupted.checkpoint} the "
+        f"interrupted attempt heartbeated",
+    )
+    run.check(
+        paused.last_failure_type == "ActivityPause",
+        f"the interrupted attempt is recorded as failing with {paused.last_failure_type!r}, want "
+        f"ActivityPause: the SDK reports an unhandled pause cancellation as a failure",
+    )
+    run.check(
+        paused.attempt == interrupted.number + 1,
+        f"the attempt counter is {paused.attempt}, want {interrupted.number + 1}: the pause spends "
+        f"the attempt it interrupted, and the next one waits for the unpause",
+    )
+    run.note(
+        "pausing a running attempt is not free: it spends one of the Activity's attempts and "
+        "leaves an ActivityPause failure on the record, as if the attempt had crashed"
+    )
+
+    await unpause(client, run)
+    if not await await_attempt(run, 2):
+        return
+    run.check(
+        run.attempts[1].resumed_from == interrupted.checkpoint,
+        f"the attempt after the unpause resumed from {run.attempts[1].resumed_from}, want "
+        f"{interrupted.checkpoint}: pause and unpause keep the heartbeat checkpoint",
+    )
+    await command(run, FINISH)
+
+
+async def drive_unpaused_in_time(client: Client, run: Run) -> None:
+    """Pause a running attempt and unpause it before it next heartbeats, so it is never told."""
+    if not await reach_heartbeating_attempt(client, run):
+        return
+    await pause(client, run)
+    if (
+        await until(
+            client,
+            run,
+            "the Activity to be PAUSE_REQUESTED",
+            lambda o: o.run_state == PAUSE_REQUESTED,
+        )
+        is None
+    ):
+        return
+    chunks = await work(run, 3)
+    run.check(
+        chunks == 3,
+        f"the attempt got through {chunks} of 3 chunks while the pause was live",
+    )
+
+    await unpause(client, run)
+    if (
+        await until(
+            client,
+            run,
+            "the Activity to be STARTED again",
+            lambda o: o.run_state == STARTED,
+        )
+        is None
+    ):
+        return
+    next_checkpoint = run.attempts[0].checkpoint + 1
+    await command(run, HEARTBEAT)
+    if await await_checkpoint(client, run, next_checkpoint) is None:
+        return
+    quiet = await stayed_quiet(run)
+    run.check(
+        quiet,
+        f"the heartbeat after the unpause brought back {run.attempts[0].cancellation}, want "
+        f"nothing: an attempt is never told of a pause it outlived",
+    )
+    observed = await observe(client, run)
+    run.check(
+        len(run.attempts) == 1 and observed.attempt == 1,
+        f"{len(run.attempts)} attempts have run and the counter is {observed.attempt}, want 1 and "
+        f"1: a pause the attempt never learned of costs nothing",
+    )
+    await command(run, FINISH)
+    closed_as = await until(
+        client, run, "the Activity to close", lambda o: not o.pending
+    )
+    if closed_as is None:
+        return
+    run.check(
+        "finished at checkpoint" in closed_as.outcome,
+        f"the Activity is {closed_as}, want the original attempt's own result",
+    )
+
+
+async def drive_retry_backoff(client: Client, run: Run) -> None:
+    """Pause between attempts, and see when unpausing lets the retry through."""
+    if not await reach_heartbeating_attempt(client, run):
+        return
+    await command(run, FAIL)
+    backing_off = await until(
+        client,
+        run,
+        "the Activity to back off before its second attempt",
+        lambda o: o.attempt == 2 and o.next_attempt_due is not None,
+    )
+    if backing_off is None:
+        return
+
+    await pause(client, run)
+    paused = await until(
+        client, run, "the Activity to be PAUSED", lambda o: o.run_state == PAUSED
+    )
+    if paused is None:
+        return
+    run.check(
+        paused.next_attempt_due is None,
+        f"next_attempt_schedule_time is {paused.next_attempt_due}, want it cleared: while paused "
+        f"the retry is not due at any particular time",
+    )
+    await asyncio.sleep(PAUSED_FOR.total_seconds())
+    run.check(
+        len(run.attempts) == 1,
+        f"{len(run.attempts)} attempts have run, want 1: the retry does not fire while paused",
+    )
+
+    unpaused_at = time.monotonic()
+    await unpause(client, run)
+    if not await await_attempt(run, 2):
+        return
+    waited = run.attempts[1].started_at - unpaused_at
+    run.behaviour = (
+        "dispatches the retry on unpause"
+        if waited < PROMPTLY.total_seconds()
+        else "makes the retry wait out the backoff it was paused in"
+    )
+    run.note(
+        f"attempt 2 started {waited:.1f}s after the unpause, "
+        f"{run.attempts[1].started_at - run.attempts[0].started_at:.1f}s into a {BACKOFF} backoff "
+        f"that was paused after {PAUSED_FOR}: this surface {run.behaviour}"
+    )
+    run.check(
+        run.attempts[1].resumed_from == run.attempts[0].checkpoint,
+        f"the attempt after the unpause resumed from {run.attempts[1].resumed_from}, want "
+        f"{run.attempts[0].checkpoint}",
+    )
+    await command(run, FINISH)
+
+
+async def drive_last_attempt(client: Client, run: Run) -> None:
+    """Pause a running attempt with no retry left for the failure the pause provokes."""
+    if not await reach_heartbeating_attempt(client, run):
+        return
+    await pause(client, run)
+    if not await heartbeat_and_await_pause(run):
+        return
+    settled = await until(
+        client,
+        run,
+        "the Activity to close or settle into PAUSED",
+        lambda o: not o.pending or o.run_state == PAUSED,
+    )
+    if settled is None:
+        return
+    run.behaviour = (
+        "closes the Activity" if not settled.pending else "keeps the Activity paused"
+    )
+    run.check(
+        not settled.pending,
+        f"the Activity is {settled}, want it closed: PauseActivityExecution documents that an "
+        f"attempt failing with no retry left closes the Activity",
+    )
+    if not settled.pending:
+        return
+    run.note(
+        f"maximum_attempts is {run.case.maximum_attempts} but the counter is {settled.attempt}, so "
+        f"the pause left the Activity in a state its retry policy does not allow; unpausing to see "
+        f"whether the attempt runs anyway"
+    )
+    await unpause(client, run)
+    if not await await_attempt(
+        run, 2, patience=PROMPTLY.total_seconds() + BACKOFF.total_seconds()
+    ):
+        run.note("unpausing produced no further attempt")
+        return
+    run.note(
+        f"unpausing ran attempt 2 despite maximum_attempts={run.case.maximum_attempts}"
+    )
+    await command(run, FINISH)
+
+
+CASES = [
+    Case("start delay", drive_start_delay, surfaces=(SAA,), start_delay=START_DELAY),
+    Case("running, ignored", drive_running_ignored, ignore_cancellation=True),
+    Case("running, honoured", drive_running_honoured),
+    Case("unpaused in time", drive_unpaused_in_time),
+    Case("retry backoff", drive_retry_backoff, retry_interval=BACKOFF),
+    Case("last attempt", drive_last_attempt, maximum_attempts=1),
+]
+
+
+async def execute(client: Client, case: Case, surface: str) -> Run:
+    run = Run(
+        case=case, surface=surface, key=f"{case.name}/{surface}/{uuid.uuid4().hex[:8]}"
+    )
+    RUNS[run.key] = run
+    log(run, "")
+    if surface == WFA:
+        await start_workflow_activity(client, run)
+    else:
+        await start_standalone_activity(client, run)
+    try:
+        await case.drive(client, run)
+    finally:
+        await command(run, FINISH)
+        await stop(client, run)
+    return run
+
+
+async def start_workflow_activity(client: Client, run: Run) -> None:
+    handle = await client.start_workflow(
+        ActivityPauseWorkload.run,
+        Params(
+            key=run.key,
+            maximum_attempts=run.case.maximum_attempts,
+            retry_interval_seconds=run.case.retry_interval.total_seconds(),
+        ),
+        id=f"activity-pause-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+    )
+    run.workflow_id = handle.id
+    run.run_id = handle.result_run_id or ""
+    run.started_at = time.monotonic()
+    log(run, f"started workflow {handle.id}")
+
+
+async def start_standalone_activity(client: Client, run: Run) -> None:
+    handle = await client.start_activity(
+        paced_job,
+        run.key,
+        id=f"activity-pause-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=RetryPolicy(
+            maximum_attempts=run.case.maximum_attempts,
+            initial_interval=run.case.retry_interval,
+            backoff_coefficient=1.0,
+        ),
+        start_delay=run.case.start_delay,
+    )
+    run.activity_id = handle.id
+    run.run_id = handle.run_id or ""
+    run.started_at = time.monotonic()
+    log(run, f"started activity {handle.id}")
+
+
+async def stop(client: Client, run: Run) -> None:
+    handle = (
+        client.get_workflow_handle(run.workflow_id, run_id=run.run_id)
+        if run.workflow_id is not None
+        else client.get_activity_handle(run.activity_id, run_id=run.run_id)
+    )
+    try:
+        await handle.terminate(reason="activity-pause workload")
+    except RPCError as err:
+        if err.status not in (
+            RPCStatusCode.NOT_FOUND,
+            RPCStatusCode.FAILED_PRECONDITION,
+        ):
+            raise
+
+
+def disagreements(runs: list[Run]) -> list[tuple[bool, str]]:
+    """Behaviour the contract leaves open is only a problem if the two surfaces differ."""
+    checks = []
+    for case in CASES:
+        recorded = {
+            run.surface: run.behaviour
+            for run in runs
+            if run.case is case and run.behaviour
+        }
+        if len(recorded) < 2:
+            continue
+        described = "; ".join(
+            f"{surface} {what}" for surface, what in sorted(recorded.items())
+        )
+        agreed = len(set(recorded.values())) == 1
+        checks.append(
+            (
+                agreed,
+                f"{case.name}: {described}" + ("" if agreed else " -- they differ"),
+            )
+        )
+    return checks
+
+
+def log(run: Run, message: str) -> None:
+    print(
+        f"{run.surface} {run.case.name:>18}  {message}" if message else "", flush=True
+    )
+
+
+async def main() -> None:
+    # Attempts are made to fail here on purpose, both by the driver and by the pauses themselves;
+    # the worker logs every one of them at warning with a traceback.
+    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=os.environ.get("TEMPORAL_API_KEY"),
+            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[ActivityPauseWorkload],
+        activities=[paced_job],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    runs: list[Run] = []
+    async with worker:
+        for case in CASES:
+            for surface in case.surfaces:
+                try:
+                    runs.append(await execute(client, case, surface))
+                except RPCError as err:
+                    if err.status != RPCStatusCode.UNIMPLEMENTED:
+                        raise
+                    sys.exit(
+                        f"{err.message}: start the server with --dynamic-config-value "
+                        "'history.enableStandaloneActivityOperatorCommands=true'"
+                    )
+
+    print(flush=True)
+    checks = [
+        (f"{run.surface} {run.case.name}", ok, message)
+        for run in runs
+        for ok, message in run.checks
+    ]
+    for ok, message in disagreements(runs):
+        checks.append(("both surfaces", ok, message))
+        print(f"{'PASS' if ok else 'FAIL'}  both surfaces  {message}", flush=True)
+    failed = [(label, message) for label, ok, message in checks if not ok]
+    print(flush=True)
+    for label, message in failed:
+        print(f"UNEXPECTED  {label}: {message}", flush=True)
+    if failed:
+        sys.exit(f"{len(failed)} of {len(checks)} checks failed")
+    print(f"all {len(checks)} checks passed", flush=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
