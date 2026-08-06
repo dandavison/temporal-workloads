@@ -2,7 +2,7 @@
 #
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["temporalio"]
+# dependencies = ["temporalio", "grpcio"]
 # ///
 """
 Check what the operator commands do to an Activity's heartbeat checkpoint, on both product
@@ -12,14 +12,18 @@ Activity (SAA). Intended semantics, from chasm/lib/activity/activity.go:
   - pause and unpause leave the checkpoint alone, so a paused-and-resumed Activity picks up
     where it left off. UnpauseActivityExecutionRequest reserved the reset_heartbeat field its
     deprecated predecessor had, so unpause has no way to ask for otherwise.
-  - reset clears it (clearHeartbeatDetails in both reset and resetKeepPaused) and puts the
-    Activity back on attempt 1, so it starts over from nothing.
+  - reset always puts the Activity back on attempt 1, and by default leaves the checkpoint
+    alone as well, so the fresh attempt 1 resumes from where the Activity had got to. Server
+    PR #11417 made that the default, for parity with what a reset does to a workflow Activity.
+  - reset with reset_heartbeat additionally discards the checkpoint (clearHeartbeatDetails in
+    both reset and resetKeepPaused), so the Activity starts over from nothing.
 
 A long-running Activity heartbeats an incrementing checkpoint. The driver waits for the server
-to hold one, then pauses, unpauses and resets, reading the server's view between operations and
-recording what each fresh attempt was handed to resume from. Both surfaces are driven through
-the same unified APIs (Pause/Unpause/ResetActivityExecution), which target a workflow Activity
-when workflow_id is set and a standalone one when it is empty.
+to hold one, then pauses, unpauses, resets, and resets again asking for the heartbeat details to
+go too, reading the server's view between operations and recording what each fresh attempt was
+handed to resume from. Both surfaces are driven through the same unified APIs
+(Pause/Unpause/ResetActivityExecution), which target a workflow Activity when workflow_id is set
+and a standalone one when it is empty.
 
 Usage:
   ./temporal-workload-activity-heartbeat-pause-reset
@@ -39,6 +43,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+import grpc
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import Payloads
 from temporalio.api.enums.v1 import PendingActivityState
@@ -46,6 +51,7 @@ from temporalio.api.workflowservice.v1 import (
     DescribeActivityExecutionRequest,
     PauseActivityExecutionRequest,
     ResetActivityExecutionRequest,
+    ResetActivityExecutionResponse,
     UnpauseActivityExecutionRequest,
 )
 from temporalio.client import Client
@@ -64,6 +70,21 @@ HEARTBEAT_TIMEOUT = timedelta(seconds=10)
 HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
 RETRY_POLICY = RetryPolicy(maximum_attempts=10, initial_interval=timedelta(seconds=1))
 
+# ResetActivityExecutionRequest.reset_heartbeat (api #848) is newer than the released Python
+# SDK's protos, so it is set as an unknown field: protobuf carries unknown fields through
+# re-serialization, so it goes on the wire as the real field 11. Wire-compatible with an SDK that
+# does know the field, which would parse these bytes into reset_heartbeat instead.
+RESET_HEARTBEAT = b"\x58\x01"
+# ...but only if nothing re-encodes the message in between, which rules out client.workflow_service:
+# the SDK's requests are decoded by sdk-core into prost types generated from those same too-old
+# protos, which drops the field before it ever reaches the server. So reset goes over a plain gRPC
+# channel, where the bytes are passed through untouched.
+RESET_METHOD = "/temporal.api.workflowservice.v1.WorkflowService/ResetActivityExecution"
+
+ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
+API_KEY = os.environ.get("TEMPORAL_API_KEY")
+
 
 @dataclass
 class Surface:
@@ -75,8 +96,6 @@ class Surface:
     run_id: str = ""
     # What each attempt of the Activity was handed to resume from, in order.
     resumed_from: list[int] = field(default_factory=list)
-    # What Describe reported immediately after resetting the paused Activity.
-    checkpoint_after_reset: int | None = None
 
 
 WFA = Surface("WFA")
@@ -241,17 +260,39 @@ async def unpause(client: Client, surface: Surface) -> None:
     )
 
 
-async def reset(client: Client, surface: Surface) -> None:
-    await client.workflow_service.reset_activity_execution(
-        ResetActivityExecutionRequest(
-            namespace=client.namespace,
-            workflow_id=surface.workflow_id or "",
-            activity_id=surface.activity_id,
-            run_id=surface.run_id,
-            identity=client.identity,
-            keep_paused=True,
-        )
+async def reset(client: Client, surface: Surface, reset_heartbeat: bool) -> None:
+    request = ResetActivityExecutionRequest(
+        namespace=client.namespace,
+        workflow_id=surface.workflow_id or "",
+        activity_id=surface.activity_id,
+        run_id=surface.run_id,
+        identity=client.identity,
+        keep_paused=True,
     )
+    if reset_heartbeat:
+        request.MergeFromString(RESET_HEARTBEAT)
+    async with raw_channel() as channel:
+        call = channel.unary_unary(
+            RESET_METHOD,
+            request_serializer=ResetActivityExecutionRequest.SerializeToString,
+            response_deserializer=ResetActivityExecutionResponse.FromString,
+        )
+        await call(request, metadata=raw_metadata())
+
+
+def raw_channel() -> grpc.aio.Channel:
+    if API_KEY:
+        return grpc.aio.secure_channel(ADDRESS, grpc.ssl_channel_credentials())
+    return grpc.aio.insecure_channel(ADDRESS)
+
+
+def raw_metadata() -> tuple[tuple[str, str], ...]:
+    if API_KEY:
+        return (
+            ("authorization", f"Bearer {API_KEY}"),
+            ("temporal-namespace", NAMESPACE),
+        )
+    return ()
 
 
 async def drive(client: Client, surface: Surface) -> list[tuple[bool, str]]:
@@ -279,30 +320,58 @@ async def drive(client: Client, surface: Surface) -> list[tuple[bool, str]]:
         f"attempt after unpause resumed from {resumed_at}, want {paused_at}",
     )
 
-    await await_checkpoint(client, surface, (paused_at or 0) + 1)
-    log(f"{surface.name}: pausing again, then resetting while paused")
-    paused_again_at = await pause_and_settle(client, surface, check)
+    paused_at = await advance_and_pause(client, surface, check, paused_at or 0)
+    await reset(client, surface, reset_heartbeat=False)
+    log(
+        f"{surface.name}: Describe reports checkpoint {await checkpoint(client, surface)} "
+        f"immediately after resetting a paused Activity (was {paused_at})"
+    )
+    check(
+        (await activity_state(client, surface)).attempt == 1,
+        "is back on attempt 1 after reset",
+    )
+    resumed_at = await unpause_and_await_attempt(client, surface)
+    check(
+        resumed_at == paused_at,
+        f"attempt after reset resumed from {resumed_at}, want {paused_at}: "
+        "a reset that does not ask for the heartbeat details keeps them",
+    )
 
-    await reset(client, surface)
+    paused_at = await advance_and_pause(client, surface, check, paused_at or 0)
+    await reset(client, surface, reset_heartbeat=True)
     # Not a pass/fail: the two surfaces clear the checkpoint at different moments, so this is
     # recorded for comparison. SAA clears it inside the reset transaction (clearHeartbeatDetails
     # in chasm/lib/activity/activity.go), while WFA defers it to when the next attempt is
     # scheduled -- deliberately, because a still-running attempt may keep heartbeating
     # (service/history/workflow/activity.go). So Describe can still report the old checkpoint
     # here even though the next attempt will be handed nothing.
-    surface.checkpoint_after_reset = await checkpoint(client, surface)
     log(
-        f"{surface.name}: Describe reports checkpoint {surface.checkpoint_after_reset} "
-        f"immediately after resetting a paused Activity (was {paused_again_at})"
+        f"{surface.name}: Describe reports checkpoint {await checkpoint(client, surface)} "
+        f"immediately after resetting a paused Activity with reset_heartbeat (was {paused_at})"
     )
     check(
         (await activity_state(client, surface)).attempt == 1,
-        "is back on attempt 1 after reset",
+        "is back on attempt 1 after reset with reset_heartbeat",
     )
-
     resumed_at = await unpause_and_await_attempt(client, surface)
-    check(resumed_at == 0, f"attempt after reset resumed from {resumed_at}, want 0")
+    check(
+        resumed_at == 0,
+        f"attempt after reset with reset_heartbeat resumed from {resumed_at}, want 0",
+    )
     return checks
+
+
+async def advance_and_pause(
+    client: Client,
+    surface: Surface,
+    check: Callable[[bool, str], None],
+    beyond: int,
+) -> int | None:
+    """Let the running attempt heartbeat past the checkpoint the last one stopped at, so the
+    reset that follows lands on an Activity with a checkpoint of its own to lose, then pause."""
+    await await_checkpoint(client, surface, beyond + 1)
+    log(f"{surface.name}: pausing again, then resetting while paused")
+    return await pause_and_settle(client, surface, check)
 
 
 async def pause_and_settle(
@@ -367,16 +436,15 @@ async def run_standalone_activity(client: Client) -> list[tuple[bool, str]]:
 
 
 async def main() -> None:
-    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
     try:
         client = await Client.connect(
-            address,
-            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
-            api_key=os.environ.get("TEMPORAL_API_KEY"),
-            tls=bool(os.environ.get("TEMPORAL_API_KEY")),
+            ADDRESS,
+            namespace=NAMESPACE,
+            api_key=API_KEY,
+            tls=bool(API_KEY),
         )
     except RuntimeError as err:
-        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+        sys.exit(f"cannot reach a Temporal server at {ADDRESS}: {err}")
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,

@@ -21,7 +21,12 @@ What the PR changed, and therefore what this tests:
   4. `update-options` gained `--start-delay` (Standalone Activity, before first
      dispatch) and fixed the update mask for `--task-queue`
      ("task_queue_name" -> "task_queue.name").
-  5. `reset` lost `--reset-heartbeats`: reset now always clears heartbeats.
+  5. `reset` lost `--reset-heartbeats`, on the grounds that reset always clears
+     heartbeats. The server has since gone the other way: server PR #11417 made
+     reset keep the heartbeat details by default, for parity with a reset of a
+     workflow Activity, and api #848 added ResetActivityExecutionRequest.
+     reset_heartbeat to ask for them to be discarded. So reset keeping them is
+     what this tests, along with the flag that should ask otherwise.
 
 Each test starts its own executions, drives the CLI as a subprocess, and
 verifies the resulting server state: DescribeActivityExecution for Standalone
@@ -33,8 +38,8 @@ because a server new enough for these APIs reports Activity statuses that
 temporalio 1.31 cannot parse. Tests are independent; their executions are
 terminated afterwards.
 
-One test asserts documented behavior that the CLI did not deliver when this was
-written (cli spk/activity-operator-cmds, server 1.32.0-160.0); it is meant to
+Two tests assert documented behavior that the CLI did not deliver when this was
+written (cli spk/activity-operator-cmds, server 1.32.0-160.0); they are meant to
 fail until that is fixed:
 
   - batch_update_options: update-options documents a batch example that changes
@@ -42,6 +47,12 @@ fail until that is fixed:
     "Either activity type must be set, or restore original should be set to
     true". The CLI's batch request also carries no ActivityOptions at all, only
     an update mask, so only `--restore-original-options` works in batch mode.
+  - reset_heartbeats: with reset no longer clearing heartbeat details by
+    default, `--reset-heartbeats` is the only way to ask for it, and the CLI
+    dropped the flag when the server still cleared them unconditionally. So
+    there is currently no way to clear an Activity's heartbeat details from the
+    command line, and `reset --help` still claims "Reset always clears the
+    heartbeat details".
 
 wf_update_options_start_delay_rejected found a second gap, now fixed in the CLI:
 `--start-delay` for a workflow Activity used to exit 0 and echo the requested
@@ -703,9 +714,10 @@ async def test_reset_keep_paused(ctx: Ctx) -> None:
 
 
 @test(SAA_RESET)
-async def test_reset_clears_heartbeats(ctx: Ctx) -> None:
-    """This PR removed --reset-heartbeats because reset always clears
-    heartbeats."""
+async def test_reset_keeps_heartbeats(ctx: Ctx) -> None:
+    """Reset rewinds the attempt counter but leaves the heartbeat details alone,
+    so the fresh attempt 1 resumes from where the Activity had got to (server
+    PR #11417)."""
     handle = await start_standalone(ctx, HEARTBEAT_FAIL)
     await wait_until(
         "an attempt to inherit heartbeat details",
@@ -714,6 +726,28 @@ async def test_reset_clears_heartbeats(ctx: Ctx) -> None:
     attempts_so_far = len(INHERITED_HEARTBEATS[handle.id])
 
     await cli_ok(ctx, "activity", "reset", "--activity-id", handle.id)
+    await wait_until(
+        "a later attempt to still inherit heartbeat details",
+        lambda: inherited_heartbeats(handle.id, after=attempts_so_far),
+    )
+
+
+@test(SAA_RESET)
+async def test_reset_heartbeats(ctx: Ctx) -> None:
+    """--reset-heartbeats is what now asks reset to discard the heartbeat
+    details (ResetActivityExecutionRequest.reset_heartbeat, api #848). The CLI
+    dropped the flag while the server was still clearing them unconditionally,
+    so this fails with "unknown flag" until it is restored."""
+    handle = await start_standalone(ctx, HEARTBEAT_FAIL)
+    await wait_until(
+        "an attempt to inherit heartbeat details",
+        lambda: inherited_heartbeats(handle.id, after=0),
+    )
+    attempts_so_far = len(INHERITED_HEARTBEATS[handle.id])
+
+    await cli_ok(
+        ctx, "activity", "reset", "--activity-id", handle.id, "--reset-heartbeats"
+    )
     await wait_until(
         "the next attempt to inherit no heartbeat details",
         lambda: lost_heartbeats(handle.id, after=attempts_so_far),
@@ -1423,21 +1457,6 @@ async def test_missing_target_error_names_the_flags(ctx: Ctx) -> None:
 
 
 @test(INVALID)
-async def test_reset_heartbeats_flag_removed(ctx: Ctx) -> None:
-    """This PR removed `reset --reset-heartbeats`; unpause keeps it."""
-    handle = await start_standalone(ctx)
-    await cli_fails(
-        ctx,
-        "activity",
-        "reset",
-        "--activity-id",
-        handle.id,
-        "--reset-heartbeats",
-        contains="unknown flag",
-    )
-
-
-@test(INVALID)
 async def test_pause_has_no_query_flag(ctx: Ctx) -> None:
     await cli_fails(
         ctx,
@@ -1462,7 +1481,6 @@ CLI_SURFACE: list[tuple[str, str, bool]] = [
     ("pause", "--run-id", True),
     ("update-options", "--start-delay", True),
     ("unpause", "--reset-heartbeats", True),
-    ("reset", "--reset-heartbeats", False),
 ]
 
 

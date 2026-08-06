@@ -1,0 +1,150 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["temporalio"]
+# ///
+"""
+Populate a namespace with Workflows and Standalone Activities left in a mix
+of terminal states: succeeded on the first attempt, succeeded only after
+some retries, and failed after exhausting all retries. Useful for exercising
+visibility queries / list filters / retry-count displays against a variety of
+execution outcomes.
+
+Runs a worker and a client in the same process; exits once every execution
+has reached its terminal state (the executions themselves persist in the
+namespace regardless).
+
+Usage:
+  ./temporal-workload-mixed-states-python [num_each]
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import asyncio
+import os
+import sys
+import uuid
+from datetime import timedelta
+
+from temporalio import activity, workflow
+from temporalio.client import ActivityHandle, Client, WorkflowHandle
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "MixedStatesWorkflow"
+ACTIVITY_TYPE = "MixedStatesActivity"
+WORKFLOW_TASK_QUEUE = "mixed-states-workflow-tq"
+ACTIVITY_TASK_QUEUE = "mixed-states-activity-tq"
+
+SUCCEED_AFTER_ATTEMPT = 3  # fails attempts 1..N-1, succeeds on attempt N
+FAIL_MAX_ATTEMPTS = 3  # exhausted without ever reaching success
+
+# kind -> (fail_until_attempt, retry_policy_maximum_attempts)
+KINDS = {
+    "succeeded": (1, 1),
+    "succeeded-after-retries": (SUCCEED_AFTER_ATTEMPT, 0),
+    "failed": (FAIL_MAX_ATTEMPTS + 1, FAIL_MAX_ATTEMPTS),
+}
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def mixed_states_activity(fail_until_attempt: int) -> str:
+    attempt = activity.info().attempt
+    if attempt < fail_until_attempt:
+        raise ApplicationError(f"induced failure on attempt {attempt}")
+    return f"succeeded on attempt {attempt}"
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class MixedStatesWorkflow:
+    @workflow.run
+    async def run(self, fail_until_attempt: int, maximum_attempts: int) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            fail_until_attempt,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=1),
+                backoff_coefficient=1.0,
+                maximum_attempts=maximum_attempts,
+            ),
+        )
+
+
+async def report(kind: str, id: str, handle: WorkflowHandle | ActivityHandle) -> None:
+    try:
+        result = await handle.result()
+        print(f"{kind:24} {id}: succeeded ({result})")
+    except Exception as e:
+        print(f"{kind:24} {id}: failed ({e})")
+
+
+async def main() -> None:
+    num_each = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+    api_key = os.environ.get("TEMPORAL_API_KEY")
+    run = uuid.uuid4().hex[:8]
+
+    client = await Client.connect(
+        address, namespace=namespace, api_key=api_key, tls=bool(api_key)
+    )
+
+    workflow_worker = Worker(
+        client,
+        task_queue=WORKFLOW_TASK_QUEUE,
+        workflows=[MixedStatesWorkflow],
+        activities=[mixed_states_activity],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    )
+    activity_worker = Worker(
+        client,
+        task_queue=ACTIVITY_TASK_QUEUE,
+        activities=[mixed_states_activity],
+    )
+    workers = asyncio.gather(workflow_worker.run(), activity_worker.run())
+
+    reporters = []
+    for kind, (fail_until_attempt, maximum_attempts) in KINDS.items():
+        for i in range(num_each):
+            workflow_id = f"mixed-states-workflow-{kind}-{run}-{i}"
+            wf_handle = await client.start_workflow(
+                MixedStatesWorkflow.run,
+                args=[fail_until_attempt, maximum_attempts],
+                id=workflow_id,
+                task_queue=WORKFLOW_TASK_QUEUE,
+            )
+            reporters.append(report(kind, workflow_id, wf_handle))
+
+            activity_id = f"mixed-states-activity-{kind}-{run}-{i}"
+            act_handle = await client.start_activity(
+                ACTIVITY_TYPE,
+                fail_until_attempt,
+                id=activity_id,
+                task_queue=ACTIVITY_TASK_QUEUE,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=1),
+                    backoff_coefficient=1.0,
+                    maximum_attempts=maximum_attempts,
+                ),
+            )
+            reporters.append(report(kind, activity_id, act_handle))
+
+    await asyncio.gather(*reporters)
+
+    workers.cancel()
+    try:
+        await workers
+    except asyncio.CancelledError:
+        pass
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
