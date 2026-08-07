@@ -594,46 +594,10 @@ async def test_pause_unknown_run_id_fails(ctx: Ctx) -> None:
 
 
 @test(SAA_PAUSE)
-async def test_unpause_reset_attempts(ctx: Ctx) -> None:
-    """--reset-attempts zeroes the attempt count as the Activity resumes."""
-    handle = await start_standalone(ctx, wait_for_attempt=ATTEMPTS_BEFORE_RESET)
-    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
-    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
-
-    await cli_ok(
-        ctx, "activity", "unpause", "--activity-id", handle.id, "--reset-attempts"
-    )
-    await wait_until(
-        "attempt count to drop",
-        lambda: saa_attempt_below(ctx, handle, ATTEMPTS_BEFORE_RESET),
-    )
-
-
-@test(SAA_PAUSE)
-async def test_unpause_reset_heartbeats(ctx: Ctx) -> None:
-    """--reset-heartbeats clears the heartbeat details the next attempt would
-    otherwise inherit."""
-    handle = await start_standalone(ctx, HEARTBEAT_FAIL)
-    await wait_until(
-        "an attempt to inherit heartbeat details",
-        lambda: inherited_heartbeats(handle.id, after=0),
-    )
-    attempts_so_far = len(INHERITED_HEARTBEATS[handle.id])
-
-    await cli_ok(ctx, "activity", "pause", "--activity-id", handle.id)
-    await wait_until("activity to be paused", lambda: saa_paused(ctx, handle))
-    await cli_ok(
-        ctx, "activity", "unpause", "--activity-id", handle.id, "--reset-heartbeats"
-    )
-    await wait_until(
-        "the next attempt to inherit no heartbeat details",
-        lambda: lost_heartbeats(handle.id, after=attempts_so_far),
-    )
-
-
-@test(SAA_PAUSE)
-async def test_unpause_keeps_heartbeats_by_default(ctx: Ctx) -> None:
-    """Without --reset-heartbeats, heartbeat details survive the pause."""
+async def test_unpause_keeps_heartbeats(ctx: Ctx) -> None:
+    """Heartbeat details survive a pause and unpause. Unpause has no way to ask
+    for otherwise: api #848 reserved reset_attempts and reset_heartbeat on
+    UnpauseActivityExecutionRequest, so the CLI dropped both flags."""
     handle = await start_standalone(ctx, HEARTBEAT_FAIL)
     await wait_until(
         "an attempt to inherit heartbeat details",
@@ -1099,7 +1063,6 @@ async def test_wf_pause_unpause_explicit_run_id(ctx: Ctx) -> None:
         handle.id,
         "--run-id",
         run_id,
-        "--reset-attempts",
     )
     await wait_until(
         "workflow activity to be unpaused", lambda: not_(wf_paused(ctx, handle))
@@ -1260,8 +1223,6 @@ async def test_batch_unpause(ctx: Ctx) -> None:
         "unpause",
         "--query",
         query,
-        "--reset-attempts",
-        "--reset-heartbeats",
         "--jitter",
         "1s",
         "--reason",
@@ -1291,7 +1252,6 @@ async def test_batch_reset(ctx: Ctx) -> None:
         "reset",
         "--query",
         query,
-        "--reset-attempts",
         "--jitter",
         "1s",
         "--yes",
@@ -1480,7 +1440,6 @@ CLI_SURFACE: list[tuple[str, str, bool]] = [
     ("pause", "--workflow-id", True),
     ("pause", "--run-id", True),
     ("update-options", "--start-delay", True),
-    ("unpause", "--reset-heartbeats", True),
 ]
 
 
