@@ -1,0 +1,593 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Park one Standalone Activity (SAA) and one Workflow Activity (WFA) in each of the six states an
+Activity passes through on its way through a retryable failure and an operator's reset, and hold
+them all there at once, so that a UI, a list filter or a Describe has every state in front of it.
+Each execution is named after the state it is parked in:
+
+  before-attempt-1                scheduled; no worker has been handed it yet
+  during-attempt-1                attempt 1 running
+  before-attempt-2-after-failure  attempt 1 failed with retries left; attempt 2 is backing off
+  during-attempt-2-after-failure  attempt 2 running
+  before-attempt-1-after-reset    reset during attempt 2; the attempt it produced is scheduled
+  during-attempt-1-after-reset    reset during attempt 2; the attempt it produced is running
+
+How each state is held, given that an Activity left alone does not stay in any of them:
+
+  during-*  by the Activity itself, which heartbeats and never returns. This is why the workload
+            has to keep running: these states live in the worker, and end when it goes away.
+  before-*  by making the next attempt undispatchable. before-attempt-2-after-failure asks for a
+            retry delay of LONG_BACKOFF, so the retry is never due. The two before-attempt-1
+            states instead have the attempt scheduled on a task queue nobody polls -- for the
+            reset case, by pointing the Activity at that queue (UpdateActivityExecutionOptions)
+            while attempt 2 is still running, so that the attempt the reset produces has nowhere
+            to go.
+
+A reset of a running attempt only lands when that attempt next heartbeats, so the Activity
+heartbeats every HEARTBEAT_INTERVAL, and the reset cases wait for the start it produces rather
+than assuming one.
+
+The two reset states are reachable on the SAA, and, on server 1.32.0-160.0, not on the WFA, so
+those two runs report what they found instead. A reset takes the attempt counter back to 1 at
+once, which invalidates the task token the running attempt is holding: the WFA's next heartbeat
+comes back not_found rather than reset, so the cancellation the worker then reports is dropped as
+belonging to an attempt the server no longer has. The server waits out the heartbeat timeout
+instead and records that as a failure, which takes the counter straight back to 2, and the attempt
+the reset produces is attempt 2. The same reset on an SAA cancels the attempt with reset=true and
+produces a genuine attempt 1.
+
+On exit the executions are terminated; pass --keep to leave them behind. Note that the before-*
+states survive the workload exiting, but the during-* ones do not: the attempt they are holding is
+cancelled with the worker, and the Activity retries from there.
+
+Usage:
+  ./temporal-workload-activity-attempt-states [--keep]
+
+Needs a server with Standalone Activities and the *ActivityExecution operator APIs, which the
+1.31 server the released CLI embeds does not have:
+
+  temporal server start-dev \
+      --dynamic-config-value activity.enableStandalone=true \
+      --dynamic-config-value history.enableStandaloneActivityOperatorCommands=true
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import argparse
+import asyncio
+import logging
+import os
+import signal
+import sys
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from google.protobuf.field_mask_pb2 import FieldMask
+from temporalio import activity, workflow
+from temporalio.api.activity.v1 import ActivityOptions
+from temporalio.api.enums.v1 import ActivityExecutionStatus, PendingActivityState
+from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.workflowservice.v1 import (
+    DescribeActivityExecutionRequest,
+    ResetActivityExecutionRequest,
+    UpdateActivityExecutionOptionsRequest,
+)
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.service import RPCError, RPCStatusCode
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "ActivityAttemptStatesWorkload"
+ACTIVITY_TYPE = "ParkedJob"
+# Tagged with the run, so that executions --keep left behind, whose Activities go on retrying
+# forever, are not handed to the next run's worker, which knows nothing about them.
+TASK_QUEUE = "activity-attempt-states-{tag}-tq"
+# Polled by nobody, so an attempt scheduled on it stays scheduled.
+DEAD_TASK_QUEUE = "activity-attempt-states-unpolled-tq"
+
+START_TO_CLOSE_TIMEOUT = timedelta(hours=24)
+# Short, because it is what the server waits out before it reaps an attempt whose completion it
+# has dropped, which is the slowest thing here.
+HEARTBEAT_TIMEOUT = timedelta(seconds=10)
+HEARTBEAT_INTERVAL = timedelta(seconds=2)
+# Small, so a reset reaches the attempt it lands on at the Activity's heartbeat rate rather than
+# at whatever rate the SDK's throttling, which defaults to a fraction of the heartbeat timeout,
+# would allow.
+HEARTBEAT_THROTTLE_INTERVAL = timedelta(seconds=1)
+
+RETRY_INTERVAL = timedelta(seconds=1)
+# The retry delay of the state that is parked between attempts: long enough that the retry is
+# never due, however long the namespace is left to be looked at.
+LONG_BACKOFF = timedelta(days=1)
+
+PATIENCE = 30.0
+
+SAA = "SAA"
+WFA = "WFA"
+
+SCHEDULED = PendingActivityState.PENDING_ACTIVITY_STATE_SCHEDULED
+STARTED = PendingActivityState.PENDING_ACTIVITY_STATE_STARTED
+
+CLOSED_STATUSES = frozenset(
+    {
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_COMPLETED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_FAILED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_CANCELED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_TERMINATED,
+        ActivityExecutionStatus.ACTIVITY_EXECUTION_STATUS_TIMED_OUT,
+    }
+)
+
+
+@dataclass
+class Start:
+    """One start of the Activity, as the Activity itself saw it."""
+
+    number: int
+    attempt: int
+    holding: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
+class Observed:
+    """What the server reports about the Activity, from whichever Describe API serves the surface
+    it is running on."""
+
+    run_state: PendingActivityState.ValueType
+    attempt: int
+    next_attempt_due: datetime | None
+    # Empty while the Activity is still pending; otherwise why it is not.
+    gone: str
+
+    def __str__(self) -> str:
+        if self.gone:
+            return self.gone
+        due = (
+            f" nextAttemptDue={self.next_attempt_due.time()}"
+            if self.next_attempt_due
+            else ""
+        )
+        return (
+            f"{PendingActivityState.Name(self.run_state)} attempt={self.attempt}{due}"
+        )
+
+
+@dataclass
+class State:
+    """One state to park an Activity in: how to get it there, and what the server then reports."""
+
+    name: str
+    parked: Callable[[Observed], bool]
+    # How many times the Activity should have started by the time it is parked.
+    starts: int
+    park: "Callable[[Client, Run], Awaitable[None]]" = lambda client, run: nothing()
+    # Whether the Activity is scheduled where a worker will pick it up, or where nothing will.
+    dispatchable: bool = True
+    retry_interval: timedelta = RETRY_INTERVAL
+    fail_first_attempt: bool = False
+
+
+@dataclass
+class Run:
+    """One state on one surface: one execution, parked."""
+
+    state: State
+    surface: str
+    key: str
+    name: str
+    activity_id: str
+    task_queue: str
+    run_id: str = ""
+    workflow_id: str | None = None
+    starts: list[Start] = field(default_factory=list)
+    observed: Observed | None = None
+    problem: str = ""
+
+
+RUNS: dict[str, Run] = {}
+
+
+@dataclass
+class Params:
+    """Workflow input: which Run the Activity belongs to, and how to schedule it."""
+
+    key: str
+    activity_id: str
+    task_queue: str
+    retry_interval_seconds: float
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def parked_job(key: str) -> str:
+    """Fail once if the Run's state needs a retryable failure, then hold, heartbeating, forever."""
+    run = RUNS[key]
+    start = Start(number=len(run.starts) + 1, attempt=activity.info().attempt)
+    run.starts.append(start)
+    log(run, f"start #{start.number} is attempt {start.attempt}")
+    if start.number == 1 and run.state.fail_first_attempt:
+        raise ApplicationError("induced retryable failure")
+    start.holding.set()
+    while True:
+        activity.heartbeat(start.number)
+        await asyncio.sleep(HEARTBEAT_INTERVAL.total_seconds())
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class ActivityAttemptStatesWorkload:
+    @workflow.run
+    async def run(self, params: Params) -> str:
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            params.key,
+            activity_id=params.activity_id,
+            task_queue=params.task_queue,
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+            heartbeat_timeout=HEARTBEAT_TIMEOUT,
+            retry_policy=retry_policy(timedelta(seconds=params.retry_interval_seconds)),
+        )
+
+
+def retry_policy(interval: timedelta) -> RetryPolicy:
+    return RetryPolicy(
+        initial_interval=interval, backoff_coefficient=1.0, maximum_attempts=0
+    )
+
+
+async def nothing() -> None:
+    pass
+
+
+def scheduled_attempt(number: int) -> Callable[[Observed], bool]:
+    return lambda o: not o.gone and o.run_state == SCHEDULED and o.attempt == number
+
+
+def running_attempt(number: int) -> Callable[[Observed], bool]:
+    return lambda o: not o.gone and o.run_state == STARTED and o.attempt == number
+
+
+async def park_during_attempt_1(client: Client, run: Run) -> None:
+    await hold(run, 1)
+
+
+async def park_during_attempt_2(client: Client, run: Run) -> None:
+    await hold(run, 2)
+
+
+async def park_before_attempt_1_after_reset(client: Client, run: Run) -> None:
+    """Reset attempt 2 with the Activity pointed at a queue nobody polls, so the attempt the reset
+    produces is scheduled and stays that way."""
+    await hold(run, 2)
+    await redirect(client, run, DEAD_TASK_QUEUE)
+    await reset(client, run)
+
+
+async def park_during_attempt_1_after_reset(client: Client, run: Run) -> None:
+    await hold(run, 2)
+    await reset(client, run)
+    await hold(run, 3)
+
+
+STATES = [
+    State(
+        "before-attempt-1",
+        parked=scheduled_attempt(1),
+        starts=0,
+        dispatchable=False,
+    ),
+    State(
+        "during-attempt-1",
+        parked=running_attempt(1),
+        starts=1,
+        park=park_during_attempt_1,
+    ),
+    State(
+        "before-attempt-2-after-failure",
+        parked=scheduled_attempt(2),
+        starts=1,
+        retry_interval=LONG_BACKOFF,
+        fail_first_attempt=True,
+    ),
+    State(
+        "during-attempt-2-after-failure",
+        parked=running_attempt(2),
+        starts=2,
+        park=park_during_attempt_2,
+        fail_first_attempt=True,
+    ),
+    State(
+        "before-attempt-1-after-reset",
+        parked=scheduled_attempt(1),
+        starts=2,
+        park=park_before_attempt_1_after_reset,
+        fail_first_attempt=True,
+    ),
+    State(
+        "during-attempt-1-after-reset",
+        parked=running_attempt(1),
+        starts=3,
+        park=park_during_attempt_1_after_reset,
+        fail_first_attempt=True,
+    ),
+]
+
+
+async def observe(client: Client, run: Run) -> Observed:
+    if run.workflow_id is not None:
+        return await observe_workflow_activity(client, run)
+    return await observe_standalone_activity(client, run)
+
+
+async def observe_workflow_activity(client: Client, run: Run) -> Observed:
+    assert run.workflow_id is not None
+    handle = client.get_workflow_handle(run.workflow_id, run_id=run.run_id)
+    described = (await handle.describe()).raw_description
+    pending = next(iter(described.pending_activities), None)
+    if pending is None:
+        return gone("the workflow has no pending Activity")
+    return Observed(
+        run_state=pending.state,
+        attempt=pending.attempt,
+        next_attempt_due=schedule_time(pending),
+        gone="",
+    )
+
+
+async def observe_standalone_activity(client: Client, run: Run) -> Observed:
+    info = (
+        await client.workflow_service.describe_activity_execution(
+            DescribeActivityExecutionRequest(
+                namespace=client.namespace,
+                activity_id=run.activity_id,
+                run_id=run.run_id,
+            )
+        )
+    ).info
+    if info.status in CLOSED_STATUSES:
+        return gone(f"closed {ActivityExecutionStatus.Name(info.status)}")
+    return Observed(
+        run_state=info.run_state,
+        attempt=info.attempt,
+        next_attempt_due=schedule_time(info),
+        gone="",
+    )
+
+
+def gone(why: str) -> Observed:
+    return Observed(
+        run_state=PendingActivityState.PENDING_ACTIVITY_STATE_UNSPECIFIED,
+        attempt=0,
+        next_attempt_due=None,
+        gone=why,
+    )
+
+
+def schedule_time(info) -> datetime | None:
+    if not info.HasField("next_attempt_schedule_time"):
+        return None
+    return info.next_attempt_schedule_time.ToDatetime()
+
+
+async def until(
+    client: Client, run: Run, what: str, condition: Callable[[Observed], bool]
+) -> bool:
+    """Poll the server until condition holds, rather than hanging if it never does."""
+    deadline = time.monotonic() + PATIENCE
+    while True:
+        run.observed = await observe(client, run)
+        if condition(run.observed):
+            return True
+        if time.monotonic() > deadline:
+            run.problem = f"timed out after {PATIENCE}s waiting for {what}, last saw {run.observed}"
+            return False
+        await asyncio.sleep(0.2)
+
+
+async def hold(run: Run, number: int) -> None:
+    """Wait for the Activity's nth start to reach the point where it holds."""
+    deadline = time.monotonic() + PATIENCE
+    while len(run.starts) < number:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"start #{number} never happened within {PATIENCE}s")
+        await asyncio.sleep(0.05)
+    await asyncio.wait_for(run.starts[number - 1].holding.wait(), PATIENCE)
+
+
+async def redirect(client: Client, run: Run, task_queue: str) -> None:
+    await client.workflow_service.update_activity_execution_options(
+        UpdateActivityExecutionOptionsRequest(
+            namespace=client.namespace,
+            workflow_id=run.workflow_id or "",
+            activity_id=run.activity_id,
+            run_id=run.run_id,
+            identity=client.identity,
+            activity_options=ActivityOptions(task_queue=TaskQueue(name=task_queue)),
+            update_mask=FieldMask(paths=["task_queue.name"]),
+        )
+    )
+    log(run, f"pointed at {task_queue}")
+
+
+async def reset(client: Client, run: Run) -> None:
+    await client.workflow_service.reset_activity_execution(
+        ResetActivityExecutionRequest(
+            namespace=client.namespace,
+            workflow_id=run.workflow_id or "",
+            activity_id=run.activity_id,
+            run_id=run.run_id,
+            identity=client.identity,
+        )
+    )
+    log(run, "reset")
+
+
+async def park(client: Client, state: State, surface: str, tag: str) -> Run:
+    name = f"{surface.lower()}-{state.name}-{tag}"
+    polled = TASK_QUEUE.format(tag=tag)
+    run = Run(
+        state=state,
+        surface=surface,
+        key=f"{surface}/{state.name}/{tag}",
+        name=name,
+        activity_id=name,
+        task_queue=polled if state.dispatchable else DEAD_TASK_QUEUE,
+    )
+    RUNS[run.key] = run
+    if surface == WFA:
+        await start_workflow_activity(client, run, polled)
+    else:
+        await start_standalone_activity(client, run)
+    try:
+        await state.park(client, run)
+    except TimeoutError as err:
+        run.problem = str(err)
+        run.observed = await observe(client, run)
+        return run
+    if await until(client, run, f"the Activity to be {state.name}", state.parked):
+        log(run, f"parked: {run.observed}")
+    if len(run.starts) != state.starts and not run.problem:
+        run.problem = (
+            f"the Activity started {len(run.starts)} times, want {state.starts}"
+        )
+    return run
+
+
+async def start_workflow_activity(client: Client, run: Run, task_queue: str) -> None:
+    handle = await client.start_workflow(
+        ActivityAttemptStatesWorkload.run,
+        Params(
+            key=run.key,
+            activity_id=run.activity_id,
+            task_queue=run.task_queue,
+            retry_interval_seconds=run.state.retry_interval.total_seconds(),
+        ),
+        id=run.name,
+        task_queue=task_queue,
+    )
+    run.workflow_id = handle.id
+    run.run_id = handle.result_run_id or ""
+
+
+async def start_standalone_activity(client: Client, run: Run) -> None:
+    handle = await client.start_activity(
+        parked_job,
+        run.key,
+        id=run.activity_id,
+        task_queue=run.task_queue,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        retry_policy=retry_policy(run.state.retry_interval),
+    )
+    run.run_id = handle.run_id or ""
+
+
+async def terminate(client: Client, run: Run) -> None:
+    handle = (
+        client.get_workflow_handle(run.workflow_id, run_id=run.run_id)
+        if run.workflow_id is not None
+        else client.get_activity_handle(run.activity_id, run_id=run.run_id)
+    )
+    try:
+        await handle.terminate(reason="activity-attempt-states workload")
+    except RPCError as err:
+        if err.status not in (
+            RPCStatusCode.NOT_FOUND,
+            RPCStatusCode.FAILED_PRECONDITION,
+        ):
+            raise
+
+
+def log(run: Run, message: str) -> None:
+    print(f"{run.surface} {run.state.name:<30}  {message}", flush=True)
+
+
+async def interrupted() -> None:
+    stop = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGINT, stop.set)
+    await stop.wait()
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="leave the executions behind instead of terminating them on exit",
+    )
+    keep = parser.parse_args().keep
+
+    # Attempts are made to fail here on purpose, and a reset cancels the attempt it lands on; the
+    # worker logs every one of them at warning with a traceback.
+    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    api_key = os.environ.get("TEMPORAL_API_KEY")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=api_key,
+            tls=bool(api_key),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+
+    tag = uuid.uuid4().hex[:8]
+    worker = Worker(
+        client,
+        task_queue=TASK_QUEUE.format(tag=tag),
+        workflows=[ActivityAttemptStatesWorkload],
+        activities=[parked_job],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_INTERVAL,
+    )
+    runs: list[Run] = []
+    async with worker:
+        try:
+            for state in STATES:
+                for surface in (SAA, WFA):
+                    runs.append(await park(client, state, surface, tag))
+        except RPCError as err:
+            if err.status != RPCStatusCode.UNIMPLEMENTED:
+                raise
+            sys.exit(f"{err.message}: this server is too old for this workload")
+
+        problems = [(run.name, run.problem) for run in runs if run.problem]
+        print(flush=True)
+        for run in runs:
+            print(
+                f"{'!' if run.problem else ' '} {run.name:<45}  {run.observed}",
+                flush=True,
+            )
+        print(flush=True)
+        for name, problem in problems:
+            print(f"UNEXPECTED  {name}: {problem}", flush=True)
+        print(
+            f"{len(runs) - len(problems)} of {len(runs)} executions are in the state they are "
+            f"named after; holding them there until interrupted",
+            flush=True,
+        )
+        await interrupted()
+        print(flush=True)
+        if not keep:
+            await asyncio.gather(*(terminate(client, run) for run in runs))
+            print(f"terminated {len(runs)} executions", flush=True)
+
+    if problems:
+        sys.exit(
+            f"{len(problems)} of {len(runs)} executions were not parked as intended"
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
