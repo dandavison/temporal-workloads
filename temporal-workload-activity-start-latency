@@ -49,9 +49,12 @@ to be read back off the queue instead of handed straight over, which on a local 
 about 40ms on every hop -- so about 40ms on the SAA and about 80ms on the WFA, which still looks
 like a plausible ratio.
 
+The distributions are drawn underneath as a histogram per variant, all sharing bin edges and a
+bar scale so that reading down a column compares the same slice of time across all of them.
+
 Usage:
   ./temporal-workload-activity-start-latency [--samples N] [--warmup N] [--settle SECONDS]
-                                             [--csv [PATH]]
+                                             [--variants NAMES] [--csv [PATH]]
 
 Env vars:
   TEMPORAL_ADDRESS    (default localhost:7233)
@@ -255,6 +258,70 @@ def report(variants: list[Variant]) -> None:
         print(
             f"\nmedian time to the Activity starting, against {variants[0].name}: {relative}"
         )
+    histograms(variants, ACTIVITY_BEGAN)
+
+
+BINS = 24
+ROWS = 6
+# Label, count, and the axis glyph, all of which come before the first bin.
+GUTTER = 19
+# Eighths of a row, so a bar's last cell can show where between two rows it stopped.
+BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def histograms(variants: list[Variant], stage: str) -> None:
+    """One histogram per variant, sharing bin edges and a bar scale, so that reading down a
+    column compares the same slice of time across all of them."""
+    series = {
+        variant.name: values
+        for variant in variants
+        if (values := collected(variant, stage))
+    }
+    if not series:
+        return
+    low = min(min(values) for values in series.values())
+    high = max(max(values) for values in series.values())
+    span = (high - low) or 1.0
+    counted = {name: binned(values, low, span) for name, values in series.items()}
+    tallest = max(max(counts) for counts in counted.values())
+
+    print(
+        f"\n{stage}, ms: {BINS} bins of {span / BINS:.2f}ms, a full-height bar being {tallest} "
+        f"of the samples\n"
+    )
+    for name, counts in counted.items():
+        for row in reversed(range(ROWS)):
+            label = f"{name:<14}" if row == ROWS - 1 else " " * 14
+            axis = f"{tallest:>3} ┤" if row == ROWS - 1 else f"{'':>3} │"
+            bars = "".join(bar(count, tallest, row) for count in counts)
+            print((label + axis + bars).rstrip())
+        print(f"{'':<14}{0:>3} └" + "─" * BINS)
+    print(" " * GUTTER + ticks(low, span))
+
+
+def binned(values: list[float], low: float, span: float) -> list[int]:
+    counts = [0] * BINS
+    for value in values:
+        counts[min(int((value - low) / span * BINS), BINS - 1)] += 1
+    return counts
+
+
+def bar(count: int, tallest: int, row: int) -> str:
+    """How much of this bin's bar falls in this row: all of it, none of it, or part."""
+    filled = count / tallest * ROWS - row
+    if filled >= 1:
+        return "█"
+    if filled <= 0:
+        return " "
+    return BLOCKS[int(filled * len(BLOCKS))]
+
+
+def ticks(low: float, span: float) -> str:
+    line = [" "] * (BINS + 8)
+    for position in range(0, BINS, BINS // 4):
+        label = f"{low + position * span / BINS:.0f}"
+        line[position : position + len(label)] = label
+    return "".join(line).rstrip()
 
 
 def write_csv(path: str, variants: list[Variant]) -> None:
@@ -290,6 +357,11 @@ async def main() -> None:
         help=f"quiet time between samples (default {SETTLE})",
     )
     parser.add_argument(
+        "--variants",
+        metavar="NAMES",
+        help="comma-separated subset of: " + ", ".join(v.name for v in VARIANTS),
+    )
+    parser.add_argument(
         "--csv",
         nargs="?",
         const="",
@@ -297,6 +369,15 @@ async def main() -> None:
         help="write every sample to PATH (default /tmp/activity-start-latency-<tag>.csv)",
     )
     args = parser.parse_args()
+
+    variants = VARIANTS
+    if args.variants:
+        wanted = [name.strip() for name in args.variants.split(",")]
+        if unknown := [
+            name for name in wanted if name not in {v.name for v in VARIANTS}
+        ]:
+            parser.error(f"no such variant: {', '.join(unknown)}")
+        variants = [variant for variant in VARIANTS if variant.name in wanted]
 
     tag = uuid.uuid4().hex[:8]
     address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
@@ -311,13 +392,13 @@ async def main() -> None:
     except RuntimeError as err:
         sys.exit(f"cannot reach a Temporal server at {address}: {err}")
 
-    for variant in VARIANTS:
+    for variant in variants:
         variant.task_queue = (
             f"activity-start-latency-{variant.name.replace(' ', '-')}-{tag}-tq"
         )
 
     async with contextlib.AsyncExitStack() as stack:
-        for variant in VARIANTS:
+        for variant in variants:
             await stack.enter_async_context(
                 Worker(
                     client,
@@ -332,8 +413,8 @@ async def main() -> None:
             measuring = round_number >= args.warmup
             # Rotated, so that no variant is always the one that goes first in a round.
             for variant in (
-                VARIANTS[round_number % len(VARIANTS) :]
-                + VARIANTS[: round_number % len(VARIANTS)]
+                variants[round_number % len(variants) :]
+                + variants[: round_number % len(variants)]
             ):
                 key = f"activity-start-latency-{tag}-{variant.name.replace(' ', '-')}-{round_number}"
                 timeline = await sample(client, variant, key)
@@ -350,9 +431,9 @@ async def main() -> None:
             )
         print(file=sys.stderr)
 
-    report(VARIANTS)
+    report(variants)
     if args.csv is not None:
-        write_csv(args.csv or f"/tmp/activity-start-latency-{tag}.csv", VARIANTS)
+        write_csv(args.csv or f"/tmp/activity-start-latency-{tag}.csv", variants)
 
 
 if __name__ == "__main__":
