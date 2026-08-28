@@ -6,20 +6,26 @@
 # ///
 """
 Measure how long it takes for an Activity function to start running, from the moment the client
-asks for it, on each of the two surfaces that can ask:
+asks for it, over four ways of asking -- three of them a single-Activity Workflow (SAW) shedding
+one round trip at a time, and the Standalone Activity that needs none of them:
 
-  SAA            StartActivity: the Activity Task goes to Matching, which hands it to a poller.
-  WFA            StartWorkflow of a Workflow whose whole body is one Activity, with the worker
-                 asking for eager Activity execution, which is what the SDK does by default: if
-                 the server agrees, it hands the Activity Task back on the response to the
-                 Workflow Task completion and Matching is never involved.
-  WFA no-eager   the same Workflow with disable_eager_activity_execution=True, so the Activity
-                 Task is scheduled and dispatched the way the SAA's is.
+  SAW               StartWorkflow, then a Workflow Task, then the Activity. The worker asks for
+                    eager Activity execution, which the SDK does by default: if the server agrees,
+                    it hands the Activity Task back on the response to the Workflow Task
+                    completion rather than through Matching.
+  SAW eager start   the same, with request_eager_start: the server returns the first Workflow Task
+                    inline on the StartWorkflowExecution response, so the Workflow Task skips
+                    Matching too.
+  SAW eager + LA    the same again, but the Workflow runs a Local Activity: the worker executes it
+                    during the Workflow Task, with no Activity Task and no second trip to the
+                    server at all.
+  SAA               StartActivity. One call, and the Activity Task goes to Matching, which hands
+                    it to a poller.
 
-Whether the server agrees to the eager hand-back is a namespace setting,
-system.enableActivityEagerExecution, which the dev server the released CLI embeds has off. The
-dispatch column says which happened: 0.0 means the Activity Task never went through Matching, so
-"WFA" and "WFA no-eager" coming out the same means the server declined.
+Both eager paths are the server's to grant, per namespace: system.enableActivityEagerExecution and
+system.enableEagerWorkflowStart. The dispatch column says whether the Activity's was granted --
+0.0 means the Activity Task never went through Matching -- and a "SAW eager start" that is no
+faster than "SAW" means the other was not.
 
 The number reported is wall-clock in one process: the driver, the client and the worker are all
 here, so a start and the Activity start it leads to are read off the same monotonic clock and no
@@ -30,31 +36,43 @@ server is doing drifts across all of them equally rather than into one.
 What is measured, the first three from the instant before the start call:
 
   start call returned  the client has the server's acknowledgement.
-  workflow code began  the worker is executing the Workflow function (WFA only). Its timestamp is
+  workflow code began  the worker is executing the Workflow function (SAW only). Its timestamp is
                        taken inside the Workflow, which is not deterministic, and is only sound
                        because these Workflows are one Workflow Task long and never replay.
   activity began       the worker is executing the Activity function. This is the headline.
   matching dispatch    the Activity's scheduled_time to its started_time, which is a difference of
                        two of the server's own timestamps and so the one number here that no clock
-                       skew can reach.
+                       skew can reach. A Local Activity has no such pair, and reports nothing.
+
+Every variant carries a --payload of random bytes into the Activity, because a start with nothing
+in it measures little: the payload is what the paths differ over. A SAW's goes to the server, back
+out on the Workflow Task, in again on the Activity's schedule command and out once more on the
+Activity Task; the SAA's makes one trip; the Local Activity's never leaves the worker after the
+Workflow Task that carried it.
 
 Each variant gets its own task queue and its own worker, so no variant waits behind another's
 pollers. The Workflows run on an UnsandboxedWorkflowRunner: the sandbox re-imports this module
 for every Workflow instance, which would be measuring the SDK's sandbox rather than the server.
-Eager Workflow start (request_eager_start) is left off, so every start is a real round trip.
 
 Sampling faster than --settle allows is the way to get numbers that are wrong without looking it:
 start the next execution before the worker's pollers are waiting again and the Activity Task has
 to be read back off the queue instead of handed straight over, which on a local dev server puts
-about 40ms on every hop -- so about 40ms on the SAA and about 80ms on the WFA, which still looks
+about 40ms on every hop -- so about 40ms on the SAA and about 80ms on a SAW, which still looks
 like a plausible ratio.
 
-The distributions are drawn underneath as a histogram per variant, all sharing bin edges and a
-bar scale so that reading down a column compares the same slice of time across all of them.
+The distributions are drawn underneath as a histogram per variant, one column of panels over one
+x-axis, all sharing bin edges and a bar scale so that reading down a column compares the same
+slice of time across all of them, each marked at its p50 and p90. --html draws the same thing as
+a self-contained page.
 
 Usage:
   ./temporal-workload-activity-start-latency [--samples N] [--warmup N] [--settle SECONDS]
-                                             [--variants NAMES] [--csv [PATH]]
+                                             [--payload BYTES] [--variants NAMES]
+                                             [--html [PATH]] [--csv [PATH]]
+
+  temporal server start-dev \
+      --dynamic-config-value system.enableActivityEagerExecution=true \
+      --dynamic-config-value system.enableEagerWorkflowStart=true
 
 Env vars:
   TEMPORAL_ADDRESS    (default localhost:7233)
@@ -71,7 +89,8 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from html import escape
 
 from temporalio import activity, workflow
 from temporalio.client import Client
@@ -90,7 +109,28 @@ RETRY_POLICY = RetryPolicy(maximum_attempts=1)
 # here grows by tens of milliseconds. See --settle.
 SETTLE = 0.25
 
+# Carried into the Activity, to put something on the wire and in the database worth timing. The
+# server's own limits bound this: it warns over 512KiB per blob and rejects over 2MiB.
+PAYLOAD_DEFAULT = "256k"
+
 MILLI = 1e6
+UNITS = {"k": 1024, "m": 1024**2}
+
+
+def size(text: str) -> int:
+    """Bytes, written as bytes or with a k or M suffix."""
+    scale = UNITS.get(text[-1:].lower(), 1)
+    return int(float(text[:-1] if scale > 1 else text) * scale)
+
+
+def human(count: int) -> str:
+    for suffix, unit in (("MiB", UNITS["m"]), ("KiB", UNITS["k"])):
+        if count >= unit:
+            return f"{count / unit:g}{suffix}"
+    return f"{count} bytes"
+
+
+PAYLOAD = size(PAYLOAD_DEFAULT)
 
 
 @dataclass
@@ -109,24 +149,30 @@ TIMELINES: dict[str, Timeline] = {}
 
 
 @activity.defn(name=ACTIVITY_TYPE)
-async def stamp(key: str) -> str:
+async def stamp(key: str, payload: bytes) -> int:
     timeline = TIMELINES[key]
     timeline.activity_began = time.monotonic_ns()
     info = activity.info()
-    timeline.dispatched = int(
-        (info.started_time - info.scheduled_time).total_seconds() * 1e9
-    )
-    return key
+    # A Local Activity's scheduled_time and started_time are the worker's own invention, not the
+    # server's, so there is no dispatch to report.
+    if not info.is_local:
+        timeline.dispatched = int(
+            (info.started_time - info.scheduled_time).total_seconds() * 1e9
+        )
+    return len(payload)
 
 
 @workflow.defn(name=WORKFLOW_TYPE)
 class SingleActivityWorkflow:
     @workflow.run
-    async def run(self, key: str) -> str:
+    async def run(self, key: str, payload: bytes, local: bool) -> int:
         TIMELINES[key].workflow_began = time.monotonic_ns()
-        return await workflow.execute_activity(
+        execute = (
+            workflow.execute_local_activity if local else workflow.execute_activity
+        )
+        return await execute(
             ACTIVITY_TYPE,
-            key,
+            args=[key, payload],
             start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
             retry_policy=RETRY_POLICY,
         )
@@ -137,16 +183,20 @@ class Variant:
     """One way of asking for the Activity, on a task queue and a worker of its own."""
 
     name: str
-    run: "Callable[[Client, Variant, str], Awaitable[None]]"
-    eager: bool = True
+    run: "Callable[[Client, Variant, str, bytes], Awaitable[None]]"
+    colour: str
+    eager_start: bool = False
+    local: bool = False
     task_queue: str = ""
     samples: list[Timeline] = field(default_factory=list)
 
 
-async def run_standalone_activity(client: Client, variant: Variant, key: str) -> None:
+async def run_standalone_activity(
+    client: Client, variant: Variant, key: str, payload: bytes
+) -> None:
     handle = await client.start_activity(
         ACTIVITY_TYPE,
-        key,
+        args=[key, payload],
         id=key,
         task_queue=variant.task_queue,
         start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
@@ -156,33 +206,54 @@ async def run_standalone_activity(client: Client, variant: Variant, key: str) ->
     await handle.result()
 
 
-async def run_workflow_activity(client: Client, variant: Variant, key: str) -> None:
+async def run_workflow_activity(
+    client: Client, variant: Variant, key: str, payload: bytes
+) -> None:
     handle = await client.start_workflow(
         SingleActivityWorkflow.run,
-        key,
+        args=[key, payload, variant.local],
         id=key,
         task_queue=variant.task_queue,
+        request_eager_start=variant.eager_start,
     )
     TIMELINES[key].accepted = time.monotonic_ns()
     await handle.result()
 
 
+# Hue by surface, not by variant: the Workflow ones are one colour and the Standalone Activity
+# another, both from the reference palette's validated leading slots. Which of the three Workflow
+# variants a panel is showing comes from its title, which is the identity channel that never
+# depends on telling two colours apart.
+SAW = "2"
+STANDALONE = "1"
 VARIANTS = [
-    Variant("SAA", run_standalone_activity),
-    Variant("WFA", run_workflow_activity),
-    Variant("WFA no-eager", run_workflow_activity, eager=False),
+    Variant("SAW", run_workflow_activity, colour=SAW),
+    Variant("SAW eager start", run_workflow_activity, colour=SAW, eager_start=True),
+    Variant(
+        "SAW eager + LA",
+        run_workflow_activity,
+        colour=SAW,
+        eager_start=True,
+        local=True,
+    ),
+    Variant("SAA", run_standalone_activity, colour=STANDALONE),
 ]
+BASELINE = "SAA"
 
 
-async def sample(client: Client, variant: Variant, key: str) -> Timeline:
+async def sample(
+    client: Client, variant: Variant, key: str, payload: bytes
+) -> Timeline:
     timeline = TIMELINES[key] = Timeline(requested=time.monotonic_ns())
-    await variant.run(client, variant, key)
+    await variant.run(client, variant, key, payload)
     return timeline
 
 
 ACTIVITY_BEGAN = "activity began"
 DISPATCHED = "matching dispatch"
 STAGES = ["start call returned", "workflow code began", ACTIVITY_BEGAN, DISPATCHED]
+# What each stage is called where four columns of numbers have to fit on a terminal.
+ABBREVIATED = dict(zip(STAGES, ["start call", "workflow code", "activity", "dispatch"]))
 
 
 def measured(timeline: Timeline) -> dict[str, float]:
@@ -218,28 +289,28 @@ def collected(variant: Variant, stage: str) -> list[float]:
     ]
 
 
-WIDTH = 21
+WIDTH = 18
 
 
 def cell(variant: Variant, stage: str) -> str:
     values = collected(variant, stage)
     if not values:
-        return f"{'-':>{WIDTH}}"
-    summary = (
-        f"{quantile(values, 0.5):.1f}/{quantile(values, 0.9):.1f}/{max(values):.1f}"
-    )
-    return f"{summary:>{WIDTH}}"
+        return "-"
+    return f"{quantile(values, 0.5):.1f}/{quantile(values, 0.9):.1f}/{max(values):.1f}"
 
 
 def report(variants: list[Variant]) -> None:
     print("\nmilliseconds, p50/p90/max\n")
-    header = "".join(
-        f"{f'{variant.name} (n={len(variant.samples)})':>{WIDTH}}"
+    named = {
+        variant.name: f"{variant.name} (n={len(variant.samples)})"
         for variant in variants
-    )
-    print(f"{'':<22}{header}")
-    for stage in STAGES:
-        print(f"{stage:<22}" + "".join(cell(variant, stage) for variant in variants))
+    }
+    names = max(len(label) for label in named.values()) + 2
+    header = "".join(f"{ABBREVIATED[stage]:>{WIDTH}}" for stage in STAGES)
+    print(f"{'':<{names}}{header}")
+    for variant in variants:
+        row = "".join(f"{cell(variant, stage):>{WIDTH}}" for stage in STAGES)
+        print(f"{named[variant.name]:<{names}}{row}")
 
     print(
         "\nEverything but the dispatch is measured from the instant before the start call, on this\n"
@@ -248,55 +319,72 @@ def report(variants: list[Variant]) -> None:
         "clock skew can reach, and it covers the hop from the Activity being scheduled to a worker\n"
         "being given it."
     )
-    baseline = quantile(collected(variants[0], ACTIVITY_BEGAN) or [0.0], 0.5)
+    against = next((v for v in variants if v.name == BASELINE), variants[0])
+    baseline = quantile(collected(against, ACTIVITY_BEGAN) or [0.0], 0.5)
     if baseline:
         relative = ", ".join(
             f"{variant.name} {quantile(collected(variant, ACTIVITY_BEGAN), 0.5) / baseline:.2f}x"
-            for variant in variants[1:]
-            if collected(variant, ACTIVITY_BEGAN)
+            for variant in variants
+            if variant is not against and collected(variant, ACTIVITY_BEGAN)
         )
         print(
-            f"\nmedian time to the Activity starting, against {variants[0].name}: {relative}"
+            f"\nmedian time to the Activity starting, against {against.name}: {relative}"
         )
     histograms(variants, ACTIVITY_BEGAN)
 
 
 BINS = 24
 ROWS = 6
-# Label, count, and the axis glyph, all of which come before the first bin.
-GUTTER = 19
+# The count and the axis glyph, which sit between the panel's gutter and its first bin.
+AXIS = 5
 # Eighths of a row, so a bar's last cell can show where between two rows it stopped.
 BLOCKS = "▁▂▃▄▅▆▇█"
 
 
-def histograms(variants: list[Variant], stage: str) -> None:
-    """One histogram per variant, sharing bin edges and a bar scale, so that reading down a
-    column compares the same slice of time across all of them."""
-    series = {
-        variant.name: values
-        for variant in variants
-        if (values := collected(variant, stage))
-    }
-    if not series:
-        return
+def distribution(
+    variants: list[Variant], stage: str
+) -> tuple[float, float, dict[str, list[int]], int]:
+    """Bin edges and a bar scale shared by every variant, so that a column is the same slice of
+    time whichever histogram it is read in."""
+    series = {variant.name: collected(variant, stage) for variant in variants}
     low = min(min(values) for values in series.values())
     high = max(max(values) for values in series.values())
     span = (high - low) or 1.0
     counted = {name: binned(values, low, span) for name, values in series.items()}
-    tallest = max(max(counts) for counts in counted.values())
+    return low, span, counted, max(max(counts) for counts in counted.values())
 
+
+def histograms(variants: list[Variant], stage: str) -> None:
+    shown = [variant for variant in variants if collected(variant, stage)]
+    if not shown:
+        return
+    low, span, counted, tallest = distribution(shown, stage)
     print(
         f"\n{stage}, ms: {BINS} bins of {span / BINS:.2f}ms, a full-height bar being {tallest} "
         f"of the samples\n"
     )
-    for name, counts in counted.items():
+    width = max(len(variant.name) for variant in shown) + 1
+    for variant in shown:
+        values = collected(variant, stage)
+        # The gutter carries the name and, under it, the quantiles the panel is marked at.
+        gutter = [
+            variant.name,
+            f"p50 {quantile(values, 0.5):.1f}",
+            f"p90 {quantile(values, 0.9):.1f}",
+        ]
+        marked = {
+            round((quantile(values, q) - low) / span * (BINS - 1)) for q in (0.5, 0.9)
+        }
         for row in reversed(range(ROWS)):
-            label = f"{name:<14}" if row == ROWS - 1 else " " * 14
+            label = f"{gutter.pop(0) if gutter else '':<{width}}"
             axis = f"{tallest:>3} ┤" if row == ROWS - 1 else f"{'':>3} │"
-            bars = "".join(bar(count, tallest, row) for count in counts)
+            bars = "".join(bar(count, tallest, row) for count in counted[variant.name])
             print((label + axis + bars).rstrip())
-        print(f"{'':<14}{0:>3} └" + "─" * BINS)
-    print(" " * GUTTER + ticks(low, span))
+        print(
+            f"{'':<{width}}{0:>3} └"
+            + "".join("┴" if index in marked else "─" for index in range(BINS))
+        )
+    print(" " * (width + AXIS) + ticks(low, span))
 
 
 def binned(values: list[float], low: float, span: float) -> list[int]:
@@ -322,6 +410,247 @@ def ticks(low: float, span: float) -> str:
         label = f"{low + position * span / BINS:.0f}"
         line[position : position + len(label)] = label
     return "".join(line).rstrip()
+
+
+CHART_WIDTH = 900
+# Wide enough for the longest panel name to sit clear of the count axis.
+MARGIN_LEFT = 160
+MARGIN_RIGHT = 24
+MARGIN_TOP = 22
+PANEL_HEIGHT = 128
+PANEL_GAP = 20
+AXIS_HEIGHT = 52
+# Never fill the bin: the leftover is the surface gap that separates neighbouring bars.
+BAR_MAX = 24
+
+# The dark steps of the same palette, chosen for the dark surface rather than flipped to it.
+# They go under both scopes: the media query for the OS setting, the attribute for a viewer who
+# stamps <html data-theme="dark"> and expects that to win.
+DARK = """
+    color-scheme: dark;
+    --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+"""
+
+STYLE = """
+  body { margin: 0; background: #f9f9f7; }
+  .viz-root {
+    color-scheme: light;
+    --surface-1: #fcfcfb; --text-primary: #0b0b0b; --text-secondary: #52514e;
+    --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+    min-height: 100vh; padding: 32px 28px; box-sizing: border-box;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text-primary);
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0d0d0d; }
+    :root:where(:not([data-theme="light"])) .viz-root {__DARK__}
+  }
+  :root[data-theme="dark"] body { background: #0d0d0d; }
+  :root[data-theme="dark"] .viz-root {__DARK__}
+  h1 { font-size: 19px; font-weight: 600; margin: 0 0 6px; }
+  p.meta { margin: 0 0 22px; font-size: 13px; color: var(--text-secondary); max-width: 880px; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px 22px; width: max-content; margin-bottom: 20px;
+  }
+  svg { max-width: 100%; height: auto; display: block; }
+  p.caption { margin: 12px 0 0; font-size: 12px; color: var(--muted); }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+  .quantile { stroke: var(--muted); stroke-width: 1; }
+  .bar { transition: filter 80ms linear; outline: none; }
+  .bar:hover, .bar:focus { filter: brightness(1.12); }
+  text { font-size: 12px; fill: var(--text-secondary); }
+  text.name { font-size: 13px; font-weight: 600; fill: var(--text-primary); }
+  text.tick, text.note, text.quantile-label { font-size: 11px; fill: var(--muted);
+                                              font-variant-numeric: tabular-nums; }
+  table { border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  caption { text-align: left; font-size: 12px; color: var(--muted); padding-bottom: 10px; }
+  th, td { padding: 6px 16px 6px 0; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; color: var(--text-secondary); }
+  thead th { border-bottom: 1px solid var(--border); font-weight: 600; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+            margin-right: 7px; vertical-align: baseline; }
+  #tip {
+    position: absolute; transform: translate(-50%, -100%); pointer-events: none;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 9px; font-size: 12px; display: flex; flex-direction: column; gap: 2px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  }
+  #tip strong { font-weight: 600; font-variant-numeric: tabular-nums; }
+  #tip span { color: var(--text-secondary); }
+""".replace("__DARK__", DARK)
+
+SCRIPT = """
+  const tip = document.getElementById('tip');
+  const show = (bar) => {
+    tip.textContent = '';
+    const count = document.createElement('strong');
+    count.textContent = bar.dataset.count + (bar.dataset.count === '1' ? ' sample' : ' samples');
+    const where = document.createElement('span');
+    where.textContent = bar.dataset.series + ' · ' + bar.dataset.range;
+    tip.append(count, where);
+    const box = bar.getBoundingClientRect();
+    tip.style.left = (window.scrollX + box.left + box.width / 2) + 'px';
+    tip.style.top = (window.scrollY + box.top - 8) + 'px';
+    tip.hidden = false;
+  };
+  for (const bar of document.querySelectorAll('.bar')) {
+    bar.addEventListener('pointerenter', () => show(bar));
+    bar.addEventListener('focus', () => show(bar));
+    bar.addEventListener('pointerleave', () => { tip.hidden = true; });
+    bar.addEventListener('blur', () => { tip.hidden = true; });
+  }
+"""
+
+
+def write_html(
+    path: str, variants: list[Variant], stage: str, meta: list[tuple[str, str]]
+) -> None:
+    """A self-contained page: the same histograms, plus the table they summarise."""
+    described = " · ".join(f"{label} {value}" for label, value in meta)
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time to an Activity starting</title>
+<style>{STYLE}</style>
+</head>
+<body>
+<div class="viz-root">
+<h1>Time to an Activity starting</h1>
+<p class="meta">{escape(described)}</p>
+<div class="card">{panels(variants, stage)}</div>
+<div class="card">{table(variants)}</div>
+</div>
+<div id="tip" hidden></div>
+<script>{SCRIPT}</script>
+</body>
+</html>
+"""
+    with open(path, "w") as file:
+        file.write(document)
+
+
+def panels(variants: list[Variant], stage: str) -> str:
+    """One histogram per variant, on shared bin edges and a shared bar scale, over a single
+    x-axis: a column is the same slice of time in every panel."""
+    shown = [variant for variant in variants if collected(variant, stage)]
+    low, span, counted, tallest = distribution(shown, stage)
+    plot = CHART_WIDTH - MARGIN_LEFT - MARGIN_RIGHT
+    slot = plot / BINS
+    thickness = min(slot - 2, BAR_MAX)
+    height = (
+        MARGIN_TOP + len(shown) * (PANEL_HEIGHT + PANEL_GAP) - PANEL_GAP + AXIS_HEIGHT
+    )
+
+    def at(milliseconds: float) -> float:
+        return MARGIN_LEFT + (milliseconds - low) / span * plot
+
+    marks = [
+        (
+            f'<svg width="{CHART_WIDTH}" height="{height:.0f}" viewBox="0 0 {CHART_WIDTH} '
+            f'{height:.0f}" role="img" aria-label="{escape(stage)} by variant">'
+        )
+    ]
+    for index, variant in enumerate(shown):
+        top = MARGIN_TOP + index * (PANEL_HEIGHT + PANEL_GAP)
+        base = top + PANEL_HEIGHT
+        values = collected(variant, stage)
+        marks += [
+            f'<line class="grid" x1="{MARGIN_LEFT}" y1="{top}" x2="{MARGIN_LEFT + plot}" y2="{top}"/>',
+            f'<line class="axis" x1="{MARGIN_LEFT}" y1="{base}" x2="{MARGIN_LEFT + plot}" y2="{base}"/>',
+            (
+                f'<rect class="swatch" x="0" y="{top + 1}" width="10" height="10" rx="2" '
+                f'fill="var(--series-{variant.colour})"/>'
+            ),
+            f'<text class="name" x="16" y="{top + 10}">{escape(variant.name)}</text>',
+            (
+                f'<text class="note" x="0" y="{top + 30}">n={len(values)} · p50 '
+                f"{quantile(values, 0.5):.1f} · p90 {quantile(values, 0.9):.1f}ms</text>"
+            ),
+            f'<text class="tick" x="{MARGIN_LEFT - 8}" y="{top + 4}" text-anchor="end">{tallest}</text>',
+            f'<text class="tick" x="{MARGIN_LEFT - 8}" y="{base + 4}" text-anchor="end">0</text>',
+        ]
+        # Behind the bars: the quantiles are there to be lined up between panels, and to say
+        # where the bulk of a long tail's samples actually are.
+        placed: list[float] = []
+        for q, name in ((0.5, "p50"), (0.9, "p90")):
+            x = at(quantile(values, q))
+            marks.append(
+                f'<line class="quantile" x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{base}"/>'
+            )
+            # Above the panel, where no bar can cover it. A label that would sit on the one
+            # before it goes to the other side of its own line.
+            anchor = "start" if all(abs(x - each) > 34 for each in placed) else "end"
+            offset = 4 if anchor == "start" else -4
+            marks.append(
+                f'<text class="quantile-label" x="{x + offset:.1f}" y="{top - 5}" '
+                f'text-anchor="{anchor}">{name}</text>'
+            )
+            placed.append(x)
+        for index_of_bin, count in enumerate(counted[variant.name]):
+            if not count:
+                continue
+            left = MARGIN_LEFT + (index_of_bin + 0.5) * slot - thickness / 2
+            edge = low + index_of_bin * span / BINS
+            marks.append(
+                f'<path class="bar" fill="var(--series-{variant.colour})" tabindex="0" '
+                f'data-series="{escape(variant.name)}" data-count="{count}" '
+                f'data-range="{edge:.1f}-{edge + span / BINS:.1f} ms" '
+                f'd="{bar_path(left, base, thickness, count / tallest * PANEL_HEIGHT)}"/>'
+            )
+
+    floor = MARGIN_TOP + len(shown) * (PANEL_HEIGHT + PANEL_GAP) - PANEL_GAP
+    for index_of_bin in range(0, BINS + 1, BINS // 4):
+        x = MARGIN_LEFT + index_of_bin * slot
+        marks += [
+            f'<line class="axis" x1="{x:.1f}" y1="{floor}" x2="{x:.1f}" y2="{floor + 5}"/>',
+            (
+                f'<text class="tick" x="{x:.1f}" y="{floor + 19}" text-anchor="middle">'
+                f"{low + index_of_bin * span / BINS:.1f}</text>"
+            ),
+        ]
+    marks.append(
+        f'<text x="{MARGIN_LEFT + plot / 2:.0f}" y="{floor + 40}" text-anchor="middle">'
+        f"milliseconds from the instant before the start call</text>"
+    )
+    return (
+        "".join(marks)
+        + "</svg>"
+        + f'<p class="caption">{BINS} bins of {span / BINS:.2f}ms, shared by every panel, as is '
+        f"the count axis: a full-height bar is {tallest} of the samples.</p>"
+    )
+
+
+def bar_path(left: float, base: float, width: float, height: float) -> str:
+    """A bar with its data-end rounded and its baseline square."""
+    radius = min(4.0, width / 2, height)
+    top = base - height
+    return (
+        f"M{left:.1f},{base:.1f} V{top + radius:.1f} "
+        f"Q{left:.1f},{top:.1f} {left + radius:.1f},{top:.1f} "
+        f"H{left + width - radius:.1f} Q{left + width:.1f},{top:.1f} "
+        f"{left + width:.1f},{top + radius:.1f} V{base:.1f} Z"
+    )
+
+
+def table(variants: list[Variant]) -> str:
+    heads = "".join(f"<th>{escape(stage)}</th>" for stage in STAGES)
+    rows = "".join(
+        f'<tr><td><span class="swatch" style="background: var(--series-{variant.colour})">'
+        f"</span>{escape(variant.name)} (n={len(variant.samples)})</td>"
+        + "".join(f"<td>{cell(variant, stage)}</td>" for stage in STAGES)
+        + "</tr>"
+        for variant in variants
+    )
+    return (
+        "<table><caption>milliseconds, p50/p90/max</caption>"
+        f"<thead><tr><th></th>{heads}</tr></thead><tbody>{rows}</tbody></table>"
+    )
 
 
 def write_csv(path: str, variants: list[Variant]) -> None:
@@ -362,6 +691,20 @@ async def main() -> None:
         help="comma-separated subset of: " + ", ".join(v.name for v in VARIANTS),
     )
     parser.add_argument(
+        "--payload",
+        type=size,
+        default=PAYLOAD,
+        metavar="BYTES",
+        help=f"input carried to the Activity, k and M accepted (default {PAYLOAD_DEFAULT})",
+    )
+    parser.add_argument(
+        "--html",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="write the histograms to PATH (default /tmp/activity-start-latency-<tag>.html)",
+    )
+    parser.add_argument(
         "--csv",
         nargs="?",
         const="",
@@ -396,6 +739,8 @@ async def main() -> None:
         variant.task_queue = (
             f"activity-start-latency-{variant.name.replace(' ', '-')}-{tag}-tq"
         )
+    # Random, so that nothing along the way gets to compress it away.
+    payload = os.urandom(args.payload)
 
     async with contextlib.AsyncExitStack() as stack:
         for variant in variants:
@@ -406,7 +751,6 @@ async def main() -> None:
                     workflows=[SingleActivityWorkflow],
                     activities=[stamp],
                     workflow_runner=UnsandboxedWorkflowRunner(),
-                    disable_eager_activity_execution=not variant.eager,
                 )
             )
         for round_number in range(args.warmup + args.samples):
@@ -417,7 +761,7 @@ async def main() -> None:
                 + variants[: round_number % len(variants)]
             ):
                 key = f"activity-start-latency-{tag}-{variant.name.replace(' ', '-')}-{round_number}"
-                timeline = await sample(client, variant, key)
+                timeline = await sample(client, variant, key, payload)
                 if measuring:
                     variant.samples.append(timeline)
                 await asyncio.sleep(args.settle)
@@ -432,6 +776,24 @@ async def main() -> None:
         print(file=sys.stderr)
 
     report(variants)
+    if args.html is not None:
+        path = args.html or f"/tmp/activity-start-latency-{tag}.html"
+        write_html(
+            path,
+            variants,
+            ACTIVITY_BEGAN,
+            [
+                ("payload", human(args.payload)),
+                ("samples", str(args.samples)),
+                ("settle", f"{args.settle}s"),
+                ("server", f"{address}/{client.namespace}"),
+                (
+                    "measured",
+                    datetime.now(UTC).astimezone().isoformat(timespec="seconds"),
+                ),
+            ],
+        )
+        print(f"\nhistograms written to {path}")
     if args.csv is not None:
         write_csv(args.csv or f"/tmp/activity-start-latency-{tag}.csv", variants)
 
