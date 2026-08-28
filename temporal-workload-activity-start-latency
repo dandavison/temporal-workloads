@@ -1,0 +1,359 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["temporalio"]
+# ///
+"""
+Measure how long it takes for an Activity function to start running, from the moment the client
+asks for it, on each of the two surfaces that can ask:
+
+  SAA            StartActivity: the Activity Task goes to Matching, which hands it to a poller.
+  WFA            StartWorkflow of a Workflow whose whole body is one Activity, with the worker
+                 asking for eager Activity execution, which is what the SDK does by default: if
+                 the server agrees, it hands the Activity Task back on the response to the
+                 Workflow Task completion and Matching is never involved.
+  WFA no-eager   the same Workflow with disable_eager_activity_execution=True, so the Activity
+                 Task is scheduled and dispatched the way the SAA's is.
+
+Whether the server agrees to the eager hand-back is a namespace setting,
+system.enableActivityEagerExecution, which the dev server the released CLI embeds has off. The
+dispatch column says which happened: 0.0 means the Activity Task never went through Matching, so
+"WFA" and "WFA no-eager" coming out the same means the server declined.
+
+The number reported is wall-clock in one process: the driver, the client and the worker are all
+here, so a start and the Activity start it leads to are read off the same monotonic clock and no
+clock skew or file-passing is involved. Each sample is one execution, run to completion before
+the next one starts, and the variants are rotated round-robin so that whatever the machine or the
+server is doing drifts across all of them equally rather than into one.
+
+What is measured, the first three from the instant before the start call:
+
+  start call returned  the client has the server's acknowledgement.
+  workflow code began  the worker is executing the Workflow function (WFA only). Its timestamp is
+                       taken inside the Workflow, which is not deterministic, and is only sound
+                       because these Workflows are one Workflow Task long and never replay.
+  activity began       the worker is executing the Activity function. This is the headline.
+  matching dispatch    the Activity's scheduled_time to its started_time, which is a difference of
+                       two of the server's own timestamps and so the one number here that no clock
+                       skew can reach.
+
+Each variant gets its own task queue and its own worker, so no variant waits behind another's
+pollers. The Workflows run on an UnsandboxedWorkflowRunner: the sandbox re-imports this module
+for every Workflow instance, which would be measuring the SDK's sandbox rather than the server.
+Eager Workflow start (request_eager_start) is left off, so every start is a real round trip.
+
+Sampling faster than --settle allows is the way to get numbers that are wrong without looking it:
+start the next execution before the worker's pollers are waiting again and the Activity Task has
+to be read back off the queue instead of handed straight over, which on a local dev server puts
+about 40ms on every hop -- so about 40ms on the SAA and about 80ms on the WFA, which still looks
+like a plausible ratio.
+
+Usage:
+  ./temporal-workload-activity-start-latency [--samples N] [--warmup N] [--settle SECONDS]
+                                             [--csv [PATH]]
+
+Env vars:
+  TEMPORAL_ADDRESS    (default localhost:7233)
+  TEMPORAL_NAMESPACE  (default "default")
+  TEMPORAL_API_KEY    (unset for local server)
+"""
+
+import argparse
+import asyncio
+import contextlib
+import os
+import sys
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+from temporalio import activity, workflow
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
+WORKFLOW_TYPE = "SingleActivityWorkflow"
+ACTIVITY_TYPE = "Stamp"
+
+START_TO_CLOSE_TIMEOUT = timedelta(seconds=30)
+# One attempt: a retry would be measuring the retry, not the start.
+RETRY_POLICY = RetryPolicy(maximum_attempts=1)
+# Between samples. Long enough for the worker's pollers to be waiting again before the next
+# execution is started: fire faster than that and a task arrives at a partition with no poller on
+# it, waits to be read back off the queue instead of being handed straight over, and every number
+# here grows by tens of milliseconds. See --settle.
+SETTLE = 0.25
+
+MILLI = 1e6
+
+
+@dataclass
+class Timeline:
+    """One execution's timestamps. All but dispatched are taken in this process off the monotonic
+    clock; dispatched is a difference of two of the server's own timestamps."""
+
+    requested: int
+    accepted: int = 0
+    workflow_began: int = 0
+    activity_began: int = 0
+    dispatched: int = 0
+
+
+TIMELINES: dict[str, Timeline] = {}
+
+
+@activity.defn(name=ACTIVITY_TYPE)
+async def stamp(key: str) -> str:
+    timeline = TIMELINES[key]
+    timeline.activity_began = time.monotonic_ns()
+    info = activity.info()
+    timeline.dispatched = int(
+        (info.started_time - info.scheduled_time).total_seconds() * 1e9
+    )
+    return key
+
+
+@workflow.defn(name=WORKFLOW_TYPE)
+class SingleActivityWorkflow:
+    @workflow.run
+    async def run(self, key: str) -> str:
+        TIMELINES[key].workflow_began = time.monotonic_ns()
+        return await workflow.execute_activity(
+            ACTIVITY_TYPE,
+            key,
+            start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+            retry_policy=RETRY_POLICY,
+        )
+
+
+@dataclass
+class Variant:
+    """One way of asking for the Activity, on a task queue and a worker of its own."""
+
+    name: str
+    run: "Callable[[Client, Variant, str], Awaitable[None]]"
+    eager: bool = True
+    task_queue: str = ""
+    samples: list[Timeline] = field(default_factory=list)
+
+
+async def run_standalone_activity(client: Client, variant: Variant, key: str) -> None:
+    handle = await client.start_activity(
+        ACTIVITY_TYPE,
+        key,
+        id=key,
+        task_queue=variant.task_queue,
+        start_to_close_timeout=START_TO_CLOSE_TIMEOUT,
+        retry_policy=RETRY_POLICY,
+    )
+    TIMELINES[key].accepted = time.monotonic_ns()
+    await handle.result()
+
+
+async def run_workflow_activity(client: Client, variant: Variant, key: str) -> None:
+    handle = await client.start_workflow(
+        SingleActivityWorkflow.run,
+        key,
+        id=key,
+        task_queue=variant.task_queue,
+    )
+    TIMELINES[key].accepted = time.monotonic_ns()
+    await handle.result()
+
+
+VARIANTS = [
+    Variant("SAA", run_standalone_activity),
+    Variant("WFA", run_workflow_activity),
+    Variant("WFA no-eager", run_workflow_activity, eager=False),
+]
+
+
+async def sample(client: Client, variant: Variant, key: str) -> Timeline:
+    timeline = TIMELINES[key] = Timeline(requested=time.monotonic_ns())
+    await variant.run(client, variant, key)
+    return timeline
+
+
+ACTIVITY_BEGAN = "activity began"
+DISPATCHED = "matching dispatch"
+STAGES = ["start call returned", "workflow code began", ACTIVITY_BEGAN, DISPATCHED]
+
+
+def measured(timeline: Timeline) -> dict[str, float]:
+    """Milliseconds for each stage the sample got through: from the start call for all of them
+    but the dispatch, which is a duration in its own right."""
+    since_request = {
+        "start call returned": timeline.accepted,
+        "workflow code began": timeline.workflow_began,
+        ACTIVITY_BEGAN: timeline.activity_began,
+    }
+    stages = {
+        stage: (at - timeline.requested) / MILLI
+        for stage, at in since_request.items()
+        if at
+    }
+    if timeline.dispatched:
+        stages[DISPATCHED] = timeline.dispatched / MILLI
+    return stages
+
+
+def quantile(values: list[float], q: float) -> float:
+    """Nearest-rank, which for these sample counts says something a linear interpolation of two
+    neighbours would not."""
+    ordered = sorted(values)
+    return ordered[min(int(q * len(ordered)), len(ordered) - 1)]
+
+
+def collected(variant: Variant, stage: str) -> list[float]:
+    return [
+        milliseconds
+        for timeline in variant.samples
+        if (milliseconds := measured(timeline).get(stage)) is not None
+    ]
+
+
+WIDTH = 21
+
+
+def cell(variant: Variant, stage: str) -> str:
+    values = collected(variant, stage)
+    if not values:
+        return f"{'-':>{WIDTH}}"
+    summary = (
+        f"{quantile(values, 0.5):.1f}/{quantile(values, 0.9):.1f}/{max(values):.1f}"
+    )
+    return f"{summary:>{WIDTH}}"
+
+
+def report(variants: list[Variant]) -> None:
+    print("\nmilliseconds, p50/p90/max\n")
+    header = "".join(
+        f"{f'{variant.name} (n={len(variant.samples)})':>{WIDTH}}"
+        for variant in variants
+    )
+    print(f"{'':<22}{header}")
+    for stage in STAGES:
+        print(f"{stage:<22}" + "".join(cell(variant, stage) for variant in variants))
+
+    print(
+        "\nEverything but the dispatch is measured from the instant before the start call, on this\n"
+        "process's monotonic clock. The dispatch is the Activity's scheduled_time to its\n"
+        "started_time: both are the server's own timestamps, so it is the one number here that no\n"
+        "clock skew can reach, and it covers the hop from the Activity being scheduled to a worker\n"
+        "being given it."
+    )
+    baseline = quantile(collected(variants[0], ACTIVITY_BEGAN) or [0.0], 0.5)
+    if baseline:
+        relative = ", ".join(
+            f"{variant.name} {quantile(collected(variant, ACTIVITY_BEGAN), 0.5) / baseline:.2f}x"
+            for variant in variants[1:]
+            if collected(variant, ACTIVITY_BEGAN)
+        )
+        print(
+            f"\nmedian time to the Activity starting, against {variants[0].name}: {relative}"
+        )
+
+
+def write_csv(path: str, variants: list[Variant]) -> None:
+    lines = ["variant,sample," + ",".join(stage.replace(" ", "_") for stage in STAGES)]
+    for variant in variants:
+        for index, timeline in enumerate(variant.samples):
+            values = measured(timeline)
+            row = ",".join(
+                f"{values[stage]:.3f}" if stage in values else "" for stage in STAGES
+            )
+            lines.append(f"{variant.name},{index},{row}")
+    with open(path, "w") as file:
+        file.write("\n".join(lines) + "\n")
+    print(f"\n{sum(len(v.samples) for v in variants)} samples written to {path}")
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--samples", type=int, default=20, help="measured samples per variant"
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        help="samples per variant to run and discard first",
+    )
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=SETTLE,
+        metavar="SECONDS",
+        help=f"quiet time between samples (default {SETTLE})",
+    )
+    parser.add_argument(
+        "--csv",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="write every sample to PATH (default /tmp/activity-start-latency-<tag>.csv)",
+    )
+    args = parser.parse_args()
+
+    tag = uuid.uuid4().hex[:8]
+    address = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+    api_key = os.environ.get("TEMPORAL_API_KEY")
+    try:
+        client = await Client.connect(
+            address,
+            namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
+            api_key=api_key,
+            tls=bool(api_key),
+        )
+    except RuntimeError as err:
+        sys.exit(f"cannot reach a Temporal server at {address}: {err}")
+
+    for variant in VARIANTS:
+        variant.task_queue = (
+            f"activity-start-latency-{variant.name.replace(' ', '-')}-{tag}-tq"
+        )
+
+    async with contextlib.AsyncExitStack() as stack:
+        for variant in VARIANTS:
+            await stack.enter_async_context(
+                Worker(
+                    client,
+                    task_queue=variant.task_queue,
+                    workflows=[SingleActivityWorkflow],
+                    activities=[stamp],
+                    workflow_runner=UnsandboxedWorkflowRunner(),
+                    disable_eager_activity_execution=not variant.eager,
+                )
+            )
+        for round_number in range(args.warmup + args.samples):
+            measuring = round_number >= args.warmup
+            # Rotated, so that no variant is always the one that goes first in a round.
+            for variant in (
+                VARIANTS[round_number % len(VARIANTS) :]
+                + VARIANTS[: round_number % len(VARIANTS)]
+            ):
+                key = f"activity-start-latency-{tag}-{variant.name.replace(' ', '-')}-{round_number}"
+                timeline = await sample(client, variant, key)
+                if measuring:
+                    variant.samples.append(timeline)
+                await asyncio.sleep(args.settle)
+            done = round_number + 1 - (args.warmup if measuring else 0)
+            print(
+                f"\r{'measured' if measuring else 'warming up'} {done}"
+                f"/{args.samples if measuring else args.warmup}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(file=sys.stderr)
+
+    report(VARIANTS)
+    if args.csv is not None:
+        write_csv(args.csv or f"/tmp/activity-start-latency-{tag}.csv", VARIANTS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
